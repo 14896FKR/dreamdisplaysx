@@ -23,7 +23,7 @@ import kotlin.math.min
  */
 class ErrorPanel(
     private val retryButton: IconButton,
-    private val deleteButton: IconButton,
+    private val closeButton: IconButton,
     private val reportButton: IconButton?,
     private val error: () -> DreamMediaException?,
 ) {
@@ -37,8 +37,11 @@ class ErrorPanel(
         val ex = error()
         val headline = translatableText(headlineKey(ex?.kind)).withStyle { it.withChatColor(ChatFormatting.RED) }
         val detailLines = detailLines(font, ex?.message, textW)
-        val hint = translatableText("dreamdisplayx.error.loadingerror.hint")
-            .withStyle { it.withChatColor(ChatFormatting.GRAY) }
+        // Without a retry button (an offline live room) the "try again" hint would point at nothing.
+        val hint = translatableText(
+            if (retryButton.visible) "dreamdisplayx.error.loadingerror.hint"
+            else "dreamdisplayx.error.loadingerror.hint_close_only",
+        ).withStyle { it.withChatColor(ChatFormatting.GRAY) }
         val headerH = UiTheme.PANEL_PADDING_Y + lh + 6
         val detailH = if (detailLines.isEmpty()) 0 else detailLines.size * (lh + 2) + 8
         val contentH = 8 + lh + 8 + detailH + lh + 12 + BUTTON_SIZE
@@ -58,18 +61,17 @@ class ErrorPanel(
 
         g.drawText(font, hint, screenW / 2 - font.width(hint) / 2, y, UiTheme.TEXT_PRIMARY, false)
 
-        // Action row centered along the bottom edge: Retry, Report (when enabled), Delete.
-        val count = 2 + (if (reportButton != null) 1 else 0)
-        val rowW = count * BUTTON_SIZE + (count - 1) * BUTTON_GAP
+        // Action row centered along the bottom edge: Retry, Report (when enabled), Close. Hidden
+        // buttons are skipped so an offline live room's panel shows one centered Close instead of a
+        // gap where Retry used to be.
+        val buttons = listOfNotNull(retryButton.takeIf { it.visible }, reportButton?.takeIf { it.visible }, closeButton)
+        val rowW = buttons.size * BUTTON_SIZE + (buttons.size - 1) * BUTTON_GAP
         val by = panel.bottom - UiTheme.PANEL_PADDING_Y - BUTTON_SIZE
         var bx = panel.centerX - rowW / 2
-        retryButton.place(UiRect(bx, by, BUTTON_SIZE, BUTTON_SIZE))
-        bx += BUTTON_SIZE + BUTTON_GAP
-        if (reportButton != null) {
-            reportButton.place(UiRect(bx, by, BUTTON_SIZE, BUTTON_SIZE))
+        for (button in buttons) {
+            button.place(UiRect(bx, by, BUTTON_SIZE, BUTTON_SIZE))
             bx += BUTTON_SIZE + BUTTON_GAP
         }
-        deleteButton.place(UiRect(bx, by, BUTTON_SIZE, BUTTON_SIZE))
     }
 
     /** Word-wraps the raw failure [message] to [maxW], capped at [MAX_DETAIL_LINES] (the last gets an ellipsis). */

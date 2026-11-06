@@ -1,6 +1,7 @@
 package com.dreamdisplayx.platform.server.credentials
 
 import com.dreamdisplayx.core.protocol.common.packets.PlatformCredentials
+import com.dreamdisplayx.util.BilibiliCookie
 import org.slf4j.LoggerFactory
 
 /**
@@ -8,9 +9,9 @@ import org.slf4j.LoggerFactory
  * the Paper and vanilla command paths so they can never drift.
  *
  * Bilibili credentials are stored in these keys:
- * - `"<uuid>:bilibili"` — the SESSDATA cookie string (per-player)
+ * - `"<uuid>:bilibili"` — the normalized cookie string (per-player)
  * - `"<uuid>:bilibili_refresh"` — the refresh token (empty if not available)
- * - `"__global__:bilibili"` — the global SESSDATA cookie string (shared across all players)
+ * - `"__global__:bilibili"` — the normalized global cookie string (shared across all players)
  * - `"__global__:bilibili_refresh"` — the global refresh token
  *
  * When a global credential is set, it is broadcast to all online players.
@@ -26,8 +27,8 @@ object CredentialActions {
 
     /** Stores a global credential for [platform] and returns the snapshot. */
     fun globalLogin(platform: String, token: String): PlatformCredentials {
-        val (sessdata, refresh) = splitToken(token.trim())
-        CredentialStore.setGlobal(platform, sessdata)
+        val (rawCookie, refresh) = splitToken(token.trim())
+        CredentialStore.setGlobal(platform, normalize(platform, rawCookie))
         if (refresh.isNotEmpty()) {
             CredentialStore.setGlobal("${platform}_refresh", refresh)
         }
@@ -49,8 +50,8 @@ object CredentialActions {
 
     /** Stores a credential for [playerUuid] on [platform] and returns the fresh snapshot. */
     fun login(playerUuid: String, platform: String, token: String): PlatformCredentials {
-        val (sessdata, refresh) = splitToken(token.trim())
-        CredentialStore.set(playerUuid, platform, sessdata)
+        val (rawCookie, refresh) = splitToken(token.trim())
+        CredentialStore.set(playerUuid, platform, normalize(platform, rawCookie))
         if (refresh.isNotEmpty()) {
             CredentialStore.set(playerUuid, "${platform}_refresh", refresh)
         }
@@ -84,6 +85,14 @@ object CredentialActions {
 
     /** True when [platform] is a supported login platform. */
     fun isSupported(platform: String): Boolean = platform.equals("bilibili", ignoreCase = true)
+
+    /** Accepts a raw cookie header, browser JSON export, or SESSDATA-only token. */
+    private fun normalize(platform: String, raw: String): String =
+        if (platform.equals("bilibili", ignoreCase = true)) {
+            BilibiliCookie.parse(raw).ifBlank { raw }
+        } else {
+            raw
+        }
 
     /**
      * Splits a combined `"<sessdata>||<refresh_token>"` token into its parts.

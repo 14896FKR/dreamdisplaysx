@@ -9,7 +9,6 @@ import com.mojang.blaze3d.pipeline.RenderPipeline
 import net.minecraft.client.renderer.rendertype.RenderSetup
 import net.minecraft.client.renderer.rendertype.RenderType
 import net.minecraft.resources.Identifier
-
 //?} else
 /*import com.mojang.blaze3d.vertex.DefaultVertexFormat
 import com.mojang.blaze3d.vertex.VertexFormat
@@ -57,6 +56,9 @@ object DisplayUnlitRenderTypes {
             .createRenderSetup(),
     )
 
+    /** Creates a blended glyph render type with linear filtering for danmaku. */
+    fun createDanmaku(name: String, id: Identifier): RenderType = create(name, id, translucent = true)
+
     /** Registers [pipeline] with Iris's `TEXTURED` program so shader packs treat it correctly; no-op without Iris. */
     private fun assignIrisTexturedProgram(pipeline: RenderPipeline) {
         runCatching {
@@ -69,15 +71,28 @@ object DisplayUnlitRenderTypes {
                 .invoke(api, pipeline, textured)
         }
     }
-    //?} else
-    /*
-    //? if >=1.21.1 {
-    fun create(name: String, id: Identifier, translucent: Boolean = false): RenderType {
+    //?}
+
+    //? if >=1.21.1 && <1.21.11 {
+    fun create(name: String, id: Identifier, translucent: Boolean = false): RenderType =
+        createLegacy(name, id, translucent, blur = false, mipmap = false)
+
+    /** Blended danmaku glyphs: linear filtering keeps scaled text legible. */
+    fun createDanmaku(name: String, id: Identifier): RenderType =
+        createLegacy(name, id, translucent = true, blur = true, mipmap = false)
+
+    private fun createLegacy(
+        name: String,
+        id: Identifier,
+        translucent: Boolean,
+        blur: Boolean,
+        mipmap: Boolean,
+    ): RenderType {
         val state = RenderType.CompositeState.builder()
             .setShaderState(RenderStateShard.ShaderStateShard(java.util.function.Supplier {
                 GameRenderer.getPositionTexColorShader()
             }))
-            .setTextureState(RenderStateShard.TextureStateShard(id, false, false))
+            .setTextureState(RenderStateShard.TextureStateShard(id, blur, mipmap))
             .setTransparencyState(if (translucent) RenderStateShard.TRANSLUCENT_TRANSPARENCY else RenderStateShard.NO_TRANSPARENCY)
             .setCullState(RenderStateShard.NO_CULL)
             .setDepthTestState(RenderStateShard.LEQUAL_DEPTH_TEST)
@@ -106,7 +121,7 @@ object DisplayUnlitRenderTypes {
         ) as RenderType
     }
     //?}
-    //?}
+
     //? if <1.21.1 {
     fun create(name: String, id: Identifier, translucent: Boolean = false): RenderType {
         val state = LegacyShards.texturedState(id, translucent)
@@ -118,6 +133,8 @@ object DisplayUnlitRenderTypes {
             null, name, DefaultVertexFormat.POSITION_TEX_COLOR, VertexFormat.Mode.QUADS, 1536, false, false, state,
         ) as RenderType
     }
+
+    fun createDanmaku(name: String, id: Identifier): RenderType = create(name, id, translucent = true)
 
     private object LegacyShards : RenderType(
         "dreamdisplayx_legacy_shards", DefaultVertexFormat.POSITION_TEX_COLOR, VertexFormat.Mode.QUADS,
@@ -133,5 +150,4 @@ object DisplayUnlitRenderTypes {
             .createCompositeState(false)
     }
     //?}
-    */
 }

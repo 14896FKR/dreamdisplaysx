@@ -104,7 +104,7 @@ class PlatformLoginScreen : UiScreenBase(literalText("Bilibili Login")) {
         val hint = "使用 Bilibili App 扫描二维码登录"
         g.drawText(font, hint, width / 2 - font.width(hint) / 2, hintY, colorGray, true)
 
-        val cookieHint = "已有 SESSDATA？直接输入 /display login bilibili <sessdata>"
+        val cookieHint = "已有 Cookie？直接输入 /display login bilibili <cookie>"
         g.drawText(font, cookieHint, width / 2 - font.width(cookieHint) / 2, hintY + 16, colorGray, true)
 
         drawChildren(g, mouseX, mouseY, partialTick)

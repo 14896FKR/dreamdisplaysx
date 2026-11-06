@@ -30,12 +30,15 @@ import com.mojang.blaze3d.vertex.VertexConsumer
 import com.mojang.blaze3d.vertex.VertexFormat
 //?}
 import net.minecraft.client.Camera
+import org.slf4j.LoggerFactory
 import kotlin.math.sin
 
 /** Renders screens in the world. Better not to touch this shit. */
 object ScreenRenderer : ClientRenderService {
     private typealias QuadAppender = (PoseStack.Pose, VertexConsumer) -> Unit
     private typealias QuadRenderer = (RenderType, QuadAppender) -> Unit
+
+    private val logger = LoggerFactory.getLogger(javaClass)
 
     /**
      * Iterates all registered screens and renders each one relative to [camera]. Pass `replay = true`
@@ -86,6 +89,9 @@ object ScreenRenderer : ClientRenderService {
         try {
             for (displayScreen in DisplayRegistry.getScreens()) {
                 displayScreen.syncReplayFrame()
+                if (displayScreen.consumeFullscreenCloseProbe()) {
+                    logger.info("{} wall render gate: {}", displayScreen.uuid, displayScreen.renderGateSummary())
+                }
                 if (displayScreen.isDormant || !displayScreen.hasTexture) continue
 
                 stack.pushPose()
@@ -164,7 +170,7 @@ object ScreenRenderer : ClientRenderService {
         // mode was switched back to LETTERBOX.
         val lift = if (replay) REPLAY_LIFT else SURFACE_LIFT
 
-        if (displayScreen.isVideoStarted && displayScreen.hasTexture && displayScreen.renderType != null) {
+        if (displayScreen.hasPictureToShow) {
             // Each quad is drawn through its own drawLayer so the backdrop and video can sit at distinct
             // z-depths: liftTowardViewer is applied BEFORE the transform's z-flattening scale, and
             // drawLayer does exactly that (the same per-layer separation the loading placeholder uses).
@@ -195,7 +201,7 @@ object ScreenRenderer : ClientRenderService {
         displayScreen: DisplayScreen, stack: PoseStack, facing: DisplayFacing, w: Int, h: Int,
         lift: Float, drawQuad: QuadRenderer, conformingQuads: List<ConformQuad>? = null,
     ) {
-        if (!displayScreen.isVideoStarted || !displayScreen.hasTexture || !displayScreen.subtitlesEnabled) return
+        if (!displayScreen.isVideoStarted || !displayScreen.hasTexture || !displayScreen.subtitlesEnabled || displayScreen.isSeekBuffering) return
         val overlay = displayScreen.subtitleOverlayTexture()
         overlay.update(displayScreen.currentSubtitleText)
         val type = overlay.renderType() ?: return
@@ -235,14 +241,16 @@ object ScreenRenderer : ClientRenderService {
         // shows the loading placeholder, and queueing danmaku onto it looks like the text appears
         // out of nowhere. Gate on the same condition that selects the video quad (isVideoStarted +
         // texture filled) so danmaku never races ahead of the first frame.
-        if (!displayScreen.isVideoStarted || !displayScreen.hasTexture) return
+        if (!displayScreen.isVideoStarted || !displayScreen.hasTexture || displayScreen.isSeekBuffering) return
         val controller = displayScreen.danmakuController()
         controller.update()
         val items = controller.renderables()
         if (items.isEmpty()) return
         val canvasWidth = (360f * w.toFloat() / h.coerceAtLeast(1)).coerceIn(240f, 1280f)
         items.forEachIndexed { index, item ->
-            val glyph = DanmakuTextLayoutCache.glyph(item.text, item.color, item.scale) ?: return@forEachIndexed
+            val glyph = DanmakuTextLayoutCache.glyph(
+                item.text, item.color, item.scale, item.count, item.colorful,
+            ) ?: return@forEachIndexed
             val rawX0 = item.x / canvasWidth
             val rawX1 = (item.x + item.width) / canvasWidth
             // Controller coordinates grow downward from the video top; display-face coordinates grow upward.

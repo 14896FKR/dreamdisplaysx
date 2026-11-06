@@ -10,6 +10,8 @@ data class PlatformVideoMetadata(
     val uploader: String?,
     val thumbnailUrl: String?,
     val uploaderAvatarUrl: String? = null,
+    /** Provider-side uploader id (Bilibili `mid`), so the menu can open that creator's page. */
+    val uploaderId: Long? = null,
     val viewCount: Long? = null,
     val durationSec: Long? = null,
     val isLive: Boolean = false,

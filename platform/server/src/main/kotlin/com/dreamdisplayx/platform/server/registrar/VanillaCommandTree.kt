@@ -50,6 +50,18 @@ object VanillaCommandTree {
     /** Selector tokens suggested for the fullscreen `target` argument, alongside online player names. */
     private val TARGET_SELECTORS = listOf("@a", "@p", "@r", "@s", "@e")
 
+    /** Link starters offered while the video URL argument is being typed. */
+    private val LINK_STARTERS = listOf(
+        "https://www.youtube.com/watch?v=",
+        "https://youtu.be/",
+        "https://www.twitch.tv/",
+        "https://vimeo.com/",
+        "https://kick.com/",
+        "https://www.bilibili.com/video/",
+        "https://b23.tv/",
+        "https://",
+    )
+
     /** Builds the full `/display` command tree, ready to attach to a dispatcher root. */
     fun build(): LiteralCommandNode<CommandSourceStack> =
         Commands.literal("display")
@@ -243,11 +255,16 @@ object VanillaCommandTree {
     private fun videoUrlArgument(token: (CommandContext<CommandSourceStack>) -> String) =
         Commands.argument("url_and_lang", StringArgumentType.greedyString())
             .suggests { _, builder ->
-                if (builder.remaining.contains(' ')) {
-                    val prefix = builder.remaining.substringAfterLast(' ')
+                val remaining = builder.remaining
+                if (!remaining.contains(' ')) {
+                    LINK_STARTERS
+                        .filter { it.length > remaining.length && it.startsWith(remaining, ignoreCase = true) }
+                        .forEach { builder.suggest(it) }
+                } else {
+                    val prefix = remaining.substringAfterLast(' ')
                     getLanguageSuggestions()
                         .filter { it.startsWith(prefix, ignoreCase = true) }
-                        .forEach { builder.suggest(builder.remaining.substringBeforeLast(' ') + " " + it) }
+                        .forEach { builder.suggest(remaining.substringBeforeLast(' ') + " " + it) }
                 }
                 builder.buildFuture()
             }

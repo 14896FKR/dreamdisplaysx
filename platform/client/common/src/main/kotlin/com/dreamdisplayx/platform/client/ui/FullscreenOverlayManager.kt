@@ -3,7 +3,10 @@ package com.dreamdisplayx.platform.client.ui
 import com.dreamdisplayx.api.playback.model.FullscreenAckAction
 import com.dreamdisplayx.api.playback.model.FullscreenMode
 import com.dreamdisplayx.core.protocol.common.packets.FullscreenAck
+import com.dreamdisplayx.platform.client.console.BorderlessConsoleScreen
+import com.dreamdisplayx.platform.client.console.BorderlessConsoleState
 import com.dreamdisplayx.platform.client.displays.DisplayScreen
+import com.dreamdisplayx.platform.client.managers.ClientStateManager
 import com.dreamdisplayx.platform.client.net.ProtocolRouter
 import com.dreamdisplayx.platform.client.utils.MinecraftScreenUtil
 import net.minecraft.client.Minecraft
@@ -57,6 +60,7 @@ object FullscreenOverlayManager {
         forced: Boolean = false,
         sessionId: String? = null
     ): FullscreenOverlay {
+        BorderlessConsoleState.seedIfNeeded(ClientStateManager.config.borderlessConsole)
         overlays.forEach { it.startClose() }
         val overlay = FullscreenOverlay(screen, mode, forced, sessionId)
         overlays.add(overlay)
@@ -66,11 +70,34 @@ object FullscreenOverlayManager {
     /** Starts the close animation for the active overlay belonging to [ds], if any. */
     fun remove(ds: DisplayScreen) {
         overlays.filter { it.displayScreen === ds }.forEach { it.startClose() }
+        // The console only exists to drive a Borderless video, so it must not outlive the overlay
+        // (e.g. playback ended and the overlay auto-closed while the input line was open).
+        BorderlessConsoleScreen.closeIfOpen()
     }
 
     /** Gracefully closes every overlay. */
     fun closeAll() {
         overlays.forEach { it.startClose() }
+    }
+
+    /**
+     * Closes the active overlay the way Esc does: a forced session minimises to PiP, a user-opened one
+     * is dismissed. Shared by the Esc edge detection and the Borderless console `exit` command.
+     */
+    fun dismissActive(mc: Minecraft) {
+        val overlay = active ?: return
+        MinecraftScreenUtil.setScreen(mc, null)
+        // The console only drives a Borderless video, so closing the overlay closes the input line as
+        // well. This path (Esc / `exit` / F) does not go through [remove], which used to be the only
+        // place that closed it.
+        BorderlessConsoleScreen.closeIfOpen()
+        if (overlay.forced) {
+            overlay.displayScreen.minimizeFullscreenToPip()
+            overlay.sessionId?.let { ProtocolRouter.send(FullscreenAck(it, FullscreenAckAction.MINIMIZED.wire)) }
+        } else {
+            overlay.displayScreen.deactivateFullscreen()
+            overlay.sessionId?.let { ProtocolRouter.send(FullscreenAck(it, FullscreenAckAction.DISMISSED.wire)) }
+        }
     }
 
     /** Immediately destroys all overlays without animation. */
@@ -88,14 +115,7 @@ object FullscreenOverlayManager {
         val screen = MinecraftScreenUtil.currentScreen(mc)
         val overlay = active
         if (overlay != null && !screenWasOpen && screen is PauseScreen) {
-            MinecraftScreenUtil.setScreen(mc, null)
-            if (overlay.forced) {
-                overlay.displayScreen.minimizeFullscreenToPip()
-                overlay.sessionId?.let { ProtocolRouter.send(FullscreenAck(it, FullscreenAckAction.MINIMIZED.wire)) }
-            } else {
-                overlay.displayScreen.deactivateFullscreen()
-                overlay.sessionId?.let { ProtocolRouter.send(FullscreenAck(it, FullscreenAckAction.DISMISSED.wire)) }
-            }
+            dismissActive(mc)
         }
         screenWasOpen = screen != null
     }

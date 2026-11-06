@@ -49,7 +49,7 @@ internal object ConformingScreenDraw {
     ) {
         if (quads.isEmpty()) return
         val clearance = DisplayGeometry.surfaceClearance() + lift
-        if (screen.isVideoStarted && screen.hasTexture && screen.renderType != null) {
+        if (screen.hasPictureToShow) {
             val appear = screen.appearProgress()
             // Match the flat-screen renderer: vertex colour applies brightness to both texture
             // formats, while the vout callback remains a bulk copy for smooth playback.

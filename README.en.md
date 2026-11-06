@@ -34,6 +34,8 @@ error on this version, **do not** submit issues to the original repository — o
 # Built for multiplayer
 
 Create a display, paste a link with `/display video <link>` — Dream DisplaysX figures out the rest.
+Links that carry a start time (`?t=299.2` on Bilibili, `?t=1m30s` on YouTube, `?start=90` anywhere) begin
+playback at that offset.
 
 Watch together with your friends with seamless multiplayer synchronization. Choose between local, synchronized, and
 broadcast playback depending on how you want your displays to behave.
@@ -71,6 +73,7 @@ Dream DisplaysX is built to make watching videos in Minecraft feel as natural as
 - **Immersive audio** — 3D sound, volume up to 200% & more
 - **Adjustable resolutions** — from 144p up to 4K; unknown direct-stream sizes are never forced to 4K
 - **Multi-track playback** — choose audio and subtitle renditions per viewer, with bilingual subtitle rendering and bounded HLS WebVTT loading; desktop audio switches keep video running, while Android rebuilds its native session and avoids duplicate muxed output
+- **Bilibili audio / CDN** — prefers Dolby / Dolby Atmos and falls back to AAC when the Dolby input dies; the API's `upos-*` backup URLs are ranked ahead of signed `mcdn` P2P edges
 - **Bounded HLS master parsing** — unused child renditions are kept lazy, so malformed or oversized masters do not trigger a serial probe storm
 - **Hardware-accelerated playback** — libvlc hardware decode (d3d11va / vaapi / videotoolbox)
 - **Video-derived dynamic lighting** — display frames light the world when LambDynamicLights is installed
@@ -113,7 +116,12 @@ Compared to the original Dream Displays, this fork adds:
   OP-only with LuckPerms support and cross-server credential sync (SQLite/MySQL).
 - **Bilibili VIP badge** — official VIP badge image, differentiating normal and annual VIP.
 - **Bilibili built-in** — Simplified Chinese translation, Bilibili search in suggestions, unreleased-content filter.
-- **Bilibili danmaku** — viewer-local scrolling comments over displays, with per-display toggle and global speed/density/filter settings.
+- **Bilibili danmaku** — viewer-local scrolling comments over displays, with per-display toggle, global speed/density/filter settings, and JSON/XML/TXT blocklist import.
+- **Creator page from the preview** — the uploader avatar and name on the preview overlay open that Bilibili creator's page.
+- **Bilibili uploader search** — toggle or use `@`; fuzzy matching opens a full uploader profile with a Bilibili-style video grid, and internal query spaces are preserved.
+- **Borderless audio consistency** — fullscreen mode keeps the wall display's distance attenuation and 3D gain.
+- **Borderless console** — Borderless freezes walking and camera turning, and an optional command line on the chat key drives playback (`F`, arrows, space) without touching chat.
+- **Playback resume** — displays resume from their saved position after leaving and re-entering a world.
 - **RTMP / RTMPS / SRT ingest** — feed an OBS-style live stream into a display.
 - **Built-in Simplified Chinese** (`zh_cn`) language file.
 - **libvlc playback engine** — low-level JNA libvlc binding (no vlcj, no FFmpeg binary, no Rust, no Python).
@@ -129,6 +137,47 @@ Set up a display using black concrete, select it with a diamond axe, and type `/
 Paper, Fabric, and NeoForge show a cyan particle outline so you can confirm the region size; set `display.particles = false`
 in `config.toml` to disable it. After the display is created, type `/display video <link> [language]`. Done! To customize the
 display, look at it and press `Shift + RMB`.
+
+## Borderless console
+
+Borderless (the video filling the whole screen) freezes walking and camera turning, so moving or looking
+around no longer shifts the 3D audio gain. Fullscreen started by the server does not lock input.
+
+The chat key (T by default) opens a command line styled like the vanilla chat bar — one thin strip at the
+bottom — and each command reports a single status line above it, with no scrolling log. Commands are typed
+bare, with no slash or prefix:
+
+| Command | What it does |
+|---|---|
+| `play` / `resume` | Start / resume playback |
+| `pause` | Pause |
+| `p` / `toggle` | Toggle play ↔ pause |
+| `seek +30`, `seek -1:30` | Seek relative to the current position (seconds or `mm:ss`) |
+| `seek 1:30`, `seek 1:02:03`, `seek 90` | Seek to an absolute position (`mm:ss` / `h:mm:ss` / bare seconds) |
+| `seek 40%` | Seek to 40% of the video duration |
+| `vol 50` / `volume 50` | Set volume to 50 (UI scale 0–200) |
+| `vol +5` / `vol -5` | Step volume by 5, clamped to 0–200 |
+| `mute` | Toggle mute |
+| `mute on` / `mute off` (also `1` / `0`) | Force mute on / off |
+| `exit` / `close` | Close Borderless and return to the world |
+| `help` / `?` | List every command |
+| `Dev` | Turn the console off (the chat key goes back to vanilla chat) |
+
+Esc closes the input line and hands the keys back to playback:
+
+| Key | What it does |
+|---|---|
+| F | Close Borderless |
+| Space | Play / pause |
+| Left / Right | Seek back / forward 5 s (Shift: 15 s) |
+| Up / Down | Volume +5 / −5 (Shift: 10) |
+| M | Mute |
+| Chat key | Reopen the console |
+
+The console is off by default. While a Borderless video plays, type `Dev` in chat and press Enter to turn it
+on for the session; that message is never sent to the server. To have it on whenever Borderless opens,
+enable **Borderless console** in the config screen or set `borderless-console = true` in
+`config/dreamdisplayx/config.toml`.
 
 ## Command reference
 
@@ -202,6 +251,7 @@ optional — defaults work fine.
 | `-Ddreamdisplayx.networkCachingMs=<ms>` | `300` | libvlc `--network-caching` / `--file-caching`. Raise if streams stutter on slow networks. |
 | `-Ddreamdisplayx.debugFps=true` | off | Draw the live delivered video FPS on the display-menu preview. |
 | `-Ddreamdisplayx.verboseLibvlc=true` | off | Enable libvlc debug logging (shows decoder/backend selection, fallback reasons). |
+| `-Ddreamdisplayx.avServo=false` | on | Turn off sample-level A/V correction (it skips or repeats PCM instead of seeking); on by default. |
 | `-Ddreamdisplayx.noDropLateFrames=true` | off | Add `--no-drop-late-frames --no-skip-frames` (diagnostic; causes old/new-frame flicker). |
 | `-Ddreamdisplayx.noAutoResync=true` | off | Disable the A/V drift correction entirely (bisection). |
 | `-Ddreamdisplayx.silentAudio=true` | off | Never open the audio line (bisection). |

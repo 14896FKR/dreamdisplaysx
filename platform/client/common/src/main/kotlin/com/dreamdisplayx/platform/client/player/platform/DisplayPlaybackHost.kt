@@ -28,6 +28,9 @@ class DisplayPlaybackHost(private val screen: DisplayScreen) : PlaybackHost {
     /** Whether playback is paused. */
     override val isPaused: Boolean get() = screen.isPaused
 
+    /** True after the screen uploaded its first decoded frame. */
+    override val hasRenderedFrame: Boolean get() = screen.hasRenderedFrame
+
     /** The mode the player experiences (`WATCH_PARTY` while a session is live). */
     override val effectiveMode: PlaybackMode get() = screen.effectiveMode
 

@@ -79,17 +79,20 @@ internal class TimelineFollower(private val screen: DisplayScreen) {
             if (generation != screen.mediaGeneration || pending?.seq != packet.seq) return@waitForMFInit
 
             val initialTimeline = screen.isWaitingForInitialTimeline
-            if (!screen.videoStarted) screen.beginPlaybackPaused(packet.paused)
+            // A live stream has no timeline: mirroring the server's paused flag here parked the picture
+            // right after it started, which read as "shows a frame then pauses itself".
+            val live = screen.isLive
+            if (!screen.videoStarted) screen.beginPlaybackPaused(if (live) false else packet.paused)
 
-            // Pause-state matching is cheap and must never be gated by the seek cooldown
-            if (packet.paused && !screen.isPaused) screen.applyServerPaused(true)
-            if (!packet.paused && screen.isPaused) screen.applyServerPaused(false)
-
-            if (screen.isLive) {
+            if (live) {
                 screen.markInitialTimelineReady()
                 pending = null
                 return@waitForMFInit
             }
+
+            // Pause-state matching is cheap and must never be gated by the seek cooldown
+            if (packet.paused && !screen.isPaused) screen.applyServerPaused(true)
+            if (!packet.paused && screen.isPaused) screen.applyServerPaused(false)
 
             if (!screen.canSeek()) {
                 screen.markInitialTimelineReady()
@@ -145,7 +148,11 @@ internal class TimelineFollower(private val screen: DisplayScreen) {
 
             // While paused the last decoded frame is what the user should keep seeing: clearing it would
             // fade the display back to its placeholder until playback resumes. Upstream 5c794ade.
-            if (!packet.paused) screen.clearRenderedFrameForTimeline()
+            // A small catch-up keeps the picture too: the landing frame replaces it within a few hundred
+            // milliseconds, and dropping it first is what showed a grey placeholder on every short seek.
+            if (!packet.paused && kotlin.math.abs(driftMs) > BIG_JUMP_CLEAR_FRAME_MS) {
+                screen.clearRenderedFrameForTimeline()
+            }
             screen.seekVideoTo(seekMs * 1_000_000L)
             lastSeekNanos = System.nanoTime()
             screen.markInitialTimelineReady()
@@ -185,5 +192,8 @@ internal class TimelineFollower(private val screen: DisplayScreen) {
 
         /** Keep catch-up overshoot this far shy of the end so we never seek past EOS. */
         private const val END_MARGIN_MS = 500L
+
+        /** Drift past this drops the picture for a re-fade; smaller catch-ups keep the last frame. */
+        private const val BIG_JUMP_CLEAR_FRAME_MS = 15_000L
     }
 }

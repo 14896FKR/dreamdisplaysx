@@ -64,6 +64,7 @@ object BiliDmSegParser {
                 color = params[3].toIntOrNull() ?: 0xFFFFFF,
                 content = node.textContent.orEmpty(),
                 pool = 0,
+                midHash = params.getOrNull(6).orEmpty(),
             )
             if (entry.renderable()) entries.add(entry)
         }
@@ -79,8 +80,10 @@ object BiliDmSegParser {
         var mode = 1
         var fontSize = 25
         var color = 0xFFFFFF
+        var midHash = ""
         var content = ""
         var pool = 0
+        var colorful = false
         while (reader.available()) {
             val tag = reader.readTag()
             val field = tag ushr 3
@@ -91,13 +94,26 @@ object BiliDmSegParser {
                 3 -> mode = reader.readVarint().toInt()
                 4 -> fontSize = reader.readVarint().toInt()
                 5 -> color = reader.readVarint().toInt()
+                6 -> midHash = String(reader.readBytes(), StandardCharsets.UTF_8)
                 7 -> content = String(reader.readBytes(), StandardCharsets.UTF_8)
                 11 -> pool = reader.readVarint().toInt()
                 12 -> idStr = String(reader.readBytes(), StandardCharsets.UTF_8)
+                24 -> colorful = reader.readVarint() == 60001L
                 else -> reader.skip(wire)
             }
         }
-        return DanmakuEntry(id, idStr, progress, mode, fontSize, color, content, pool)
+        return DanmakuEntry(
+            id = id,
+            idStr = idStr,
+            progressMs = progress,
+            mode = mode,
+            fontSize = fontSize,
+            color = color,
+            content = content,
+            pool = pool,
+            midHash = midHash,
+            colorful = colorful,
+        )
     }
 
     /** Minimal protobuf wire-format reader (varint / length-delimited / fixed32 / fixed64). */

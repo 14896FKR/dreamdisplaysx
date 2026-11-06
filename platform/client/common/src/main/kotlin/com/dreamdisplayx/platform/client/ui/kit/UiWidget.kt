@@ -29,6 +29,9 @@ abstract class UiWidget(message: Component) : AbstractWidget(0, 0, 0, 0, message
     /** Re-evaluated each frame to drive [visible]; invisible widgets are skipped entirely. */
     var visibleWhen: () -> Boolean = { true }
 
+    /** Optional real-screen clip rect; used by scrollable panels to clip partially visible controls. */
+    var clipScreenRect: UiRect? = null
+
     /** Moves and resizes this widget to [r]; layout code calls this once per frame. */
     fun place(r: UiRect) {
         x = r.x
@@ -54,8 +57,14 @@ abstract class UiWidget(message: Component) : AbstractWidget(0, 0, 0, 0, message
     protected open fun requestWidgetCursor(g: GuiGraphicsExtractor) = handleCursor(g)
 
     final override fun extractWidgetRenderState(g: GuiGraphicsExtractor, mouseX: Int, mouseY: Int, partialTick: Float) {
-        draw(g, mouseX, mouseY, partialTick)
-        if (handlesWholeWidgetCursor()) requestWidgetCursor(g)
+        val clip = clipScreenRect
+        if (clip != null) g.enableScissor(clip.x, clip.y, clip.right, clip.bottom)
+        try {
+            draw(g, mouseX, mouseY, partialTick)
+            if (handlesWholeWidgetCursor()) requestWidgetCursor(g)
+        } finally {
+            if (clip != null) g.disableScissor()
+        }
     }
 
     /** Draws [text] centered over the widget with vanilla scrolling-on-overflow behavior. */
@@ -67,8 +76,15 @@ abstract class UiWidget(message: Component) : AbstractWidget(0, 0, 0, 0, message
     //?} else
     /*
     //? if >=1.20 {
-    final override fun renderWidget(g: GuiGraphics, mouseX: Int, mouseY: Int, partialTick: Float) =
-        draw(g, mouseX, mouseY, partialTick)
+    final override fun renderWidget(g: GuiGraphics, mouseX: Int, mouseY: Int, partialTick: Float) {
+        val clip = clipScreenRect
+        if (clip != null) g.enableScissor(clip.x, clip.y, clip.right, clip.bottom)
+        try {
+            draw(g, mouseX, mouseY, partialTick)
+        } finally {
+            if (clip != null) g.disableScissor()
+        }
+    }
     //?}
     //? if >=1.19.4 <1.20 {
     final override fun renderWidget(pose: com.mojang.blaze3d.vertex.PoseStack, mouseX: Int, mouseY: Int, partialTick: Float) =

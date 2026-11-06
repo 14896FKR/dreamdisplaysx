@@ -53,7 +53,7 @@ class MenuLayout private constructor(
 
             // The horizontal suggestions strip is a fixed-height band, not a fraction of the screen:
             // it must fit its own header + search row (STRIP_CHROME_H) plus a full result card
-            // (16:9 thumbnail + two title lines + meta = FULL_CARD_VIEWPORT_H). Reserve that comfortable
+            // (16:9 thumbnail + one title line + meta = FULL_CARD_VIEWPORT_H). Reserve that comfortable
             // height so cards are never clipped, then hand everything else to the preview/settings row
             // (which the user wants as large as possible). On short screens it shrinks toward a floor
             // that still shows an un-clipped, if smaller, card; below that it's dropped entirely.

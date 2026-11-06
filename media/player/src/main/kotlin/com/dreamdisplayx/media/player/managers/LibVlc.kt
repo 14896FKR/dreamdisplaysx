@@ -32,20 +32,17 @@ object LibVlc {
     private val logger = org.slf4j.LoggerFactory.getLogger("DreamDisplaysX/LibVlc")
 
     /**
-     * JNA's default callback policy detaches a thread it attached after the first callback. VLC's
-     * Android bridge caches that thread's JNIEnv in its own pthread TLS, so make callback threads stay
-     * attached until their native owner exits. This is a mitigation for the JNA/VLC TLS ordering
-     * hazard; Android loading order below is the stronger protection because it creates VLC's JNI TLS
-     * key before JNA can create its callback TLS key.
+     * JNA's default callback policy attaches and detaches a native thread on every callback. VLC
+     * invokes the vmem lock/unlock/display callbacks for every frame, so keep those threads attached
+     * until their native owner exits instead of paying a thread attach per frame.
      */
-    private val androidCallbackThreadInitializer =
+    private val callbackThreadInitializer =
         CallbackThreadInitializer(true, false, "DreamDisplaysX-libvlc")
 
-    /** Applies the Android callback-thread policy before libvlc can invoke [callback]. */
+    /** Applies the persistent callback-thread policy before libvlc can invoke [callback]. */
     fun configureCallbackThread(callback: Callback) {
-        if (!com.dreamdisplayx.util.OsInfo.isAndroid) return
         runCatching {
-            Native.setCallbackThreadInitializer(callback, androidCallbackThreadInitializer)
+            Native.setCallbackThreadInitializer(callback, callbackThreadInitializer)
         }.onFailure {
             logger.debug("Could not configure JNA callback thread policy: {}", it.message)
         }
@@ -65,6 +62,7 @@ object LibVlc {
      * (Playing=3, Paused=4, Stopped=5, Ended=6), NOT the libvlc_event_e constants above (0x1xx).
      * Never compare a state against the event constants.
      */
+    const val LIBVLC_STATE_BUFFERING = 2
     const val LIBVLC_STATE_PLAYING = 3
     const val LIBVLC_STATE_PAUSED = 4
     const val LIBVLC_STATE_STOPPED = 5
@@ -170,17 +168,11 @@ object LibVlc {
     private var hwBackendStep: Int = 0
 
     /**
-     * libvlc log markers that identify a hardware-decode backend failure (as opposed to a
-     * network/stream error). Mirrors the exact strings libvlc 3.0's avcodec/d3d11va modules
-     * log: surface-allocation failure and the timestamp-conversion failures that precede it
-     * (observed on NVIDIA d3d11va: "Timestamp conversion failed for X: no reference clock"
-     * then "Could not convert timestamp 0 for FFmpeg", finally "hardware acceleration
-     * picture allocation failed").
+     * Hardware-specific libvlc failures that justify stepping the backend chain down.
+     * Timestamp-conversion lines occur on normal seeks/rebuilds too, so they are not used alone.
      */
     private val HW_FAILURE_MARKERS = arrayOf(
         "hardware acceleration picture allocation failed",
-        "Timestamp conversion failed",
-        "Could not convert timestamp",
         "Failed to create Direct3D device",
         "DXVA2 decoding is not supported",
     )
@@ -292,7 +284,7 @@ object LibVlc {
             val opts = mutableListOf("--no-video-title-show", "--no-snapshot-preview", "--verbose=1",
                 "--no-keyboard-events", "--no-mouse-events",
                 "--network-caching=${networkCachingMs()}",
-                "--file-caching=${networkCachingMs()}", "--live-caching=600", "--audio-filter=scaletempo")
+                "--file-caching=${networkCachingMs()}", "--live-caching=300", "--audio-filter=scaletempo")
             // Instance-level browser UA so EVERY http request (including the :input-slave audio
             // stream, which is a separate HTTP transaction from the video) carries a browser-shaped
             // User-Agent. Bilibili/YouTube CDNs reject libvlc's default UA, and media-level options
@@ -406,10 +398,26 @@ object LibVlc {
         }
     }
 
+    /** HTTP/2 frame logs dominate verbose output and add no playback diagnostics. */
+    private val http2FrameNoise = setOf(
+        "DATA", "WINDOW_UPDATE", "SETTINGS", "PING", "HEADERS", "PRIORITY", "CONTINUATION",
+    )
+
+    private fun isHttp2FrameNoise(text: String): Boolean {
+        val rest = when {
+            text.startsWith("in ") -> text.substring(3)
+            text.startsWith("out ") -> text.substring(4)
+            else -> return false
+        }
+        val op = rest.removePrefix("(priority) ").substringBefore(' ')
+        return op in http2FrameNoise
+    }
+
     /** Strongly referenced libvlc log callback: forwards recent messages into [logRing]. */
     private val logCallback: LogCallback = LogCallback { _, level, _, fmt, args ->
         try {
             val text = formatLogLine(fmt, args) ?: return@LogCallback
+            if (isHttp2FrameNoise(text)) return@LogCallback
             val line = if (level >= 3) "E: $text" else "W: $text"
             synchronized(logRing) {
                 logRing.add(line)
@@ -708,7 +716,8 @@ object LibVlc {
         fun libvlc_media_player_is_seekable(player: Pointer): Int
         fun libvlc_media_player_can_pause(player: Pointer): Int
         fun libvlc_media_player_get_time(player: Pointer): Long
-        fun libvlc_media_player_set_time(player: Pointer, time: Long)
+        // 0 = seek accepted, -1 = libvlc refused it (input not seekable / demuxer not ready).
+        fun libvlc_media_player_set_time(player: Pointer, time: Long): Int
         fun libvlc_media_player_get_length(player: Pointer): Long
         fun libvlc_media_player_get_state(player: Pointer): Int
         fun libvlc_media_player_get_fps(player: Pointer): Float

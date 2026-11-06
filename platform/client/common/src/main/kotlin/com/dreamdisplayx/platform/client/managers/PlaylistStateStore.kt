@@ -1,5 +1,6 @@
 package com.dreamdisplayx.platform.client.managers
 
+import com.dreamdisplayx.core.protocol.common.packets.PlaylistAddItem
 import com.dreamdisplayx.core.protocol.common.packets.PlaylistCommand
 import com.dreamdisplayx.core.protocol.common.packets.PlaylistState
 import com.dreamdisplayx.platform.client.Initializer
@@ -32,8 +33,7 @@ object PlaylistStateStore {
     }
 
     /** Sends one queue command for [displayId]; the authoritative echo refreshes the panel. */
-    fun send(
-        displayId: java.util.UUID,
+    fun send(        displayId: java.util.UUID,
         action: Int,
         itemId: java.util.UUID? = null,
         position: Int = -1,
@@ -61,6 +61,19 @@ object PlaylistStateStore {
                 expectedPlayRevision = expectedPlayRevision,
                 expectedItemId = expectedItemId ?: java.util.UUID(0L, 0L),
             ),
+        )
+    }
+
+    /** Sends one batched append; the server applies the whole list as a single mutation and broadcast. */
+    fun sendBatch(
+        displayId: java.util.UUID,
+        action: Int,
+        items: List<PlaylistAddItem>,
+        lang: String = "",
+    ) {
+        if (items.isEmpty()) return
+        Initializer.sendPacket(
+            PlaylistCommand(displayId = displayId, action = action, lang = lang, items = items),
         )
     }
 }

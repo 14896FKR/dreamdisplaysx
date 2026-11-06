@@ -34,6 +34,8 @@ internal object AwtOverlayFontProvider {
         fun draw(graphics: Graphics2D, x: Float, baseline: Float) {
             delegate.draw(graphics, x, baseline)
         }
+
+        fun outline(): java.awt.Shape = delegate.getOutline(null)
     }
 
     /**
@@ -86,13 +88,30 @@ internal object AwtOverlayFontProvider {
     }
 
     /** Creates a shaped layout whose metrics and drawing use exactly the same font runs. */
-    internal fun layout(text: String, style: Int, sizePx: Int, frc: FontRenderContext): OverlayLayout {
+    internal fun layout(
+        text: String,
+        style: Int,
+        sizePx: Int,
+        frc: FontRenderContext,
+        prefix: String? = null,
+    ): OverlayLayout {
         require(text.isNotEmpty()) { "Text layout cannot be empty" }
         val logical = logicalFont(style, sizePx)
         val runs = fontRuns(text, logical)
-        val attributed = AttributedString(text)
+        val full = (prefix ?: "") + text
+        val attributed = AttributedString(full)
+        if (prefix != null) {
+            val prefixFont = logicalFont(style, (sizePx * 0.6f).toInt().coerceAtLeast(1))
+            attributed.addAttribute(TextAttribute.FONT, prefixFont, 0, prefix.length)
+        }
+        val offset = prefix?.length ?: 0
         for (run in runs) {
-            attributed.addAttribute(TextAttribute.FONT, run.font, run.start, run.endExclusive)
+            attributed.addAttribute(
+                TextAttribute.FONT,
+                run.font,
+                offset + run.start,
+                offset + run.endExclusive,
+            )
         }
         return OverlayLayout(TextLayout(attributed.getIterator(), frc))
     }
@@ -132,6 +151,10 @@ internal object AwtOverlayFontProvider {
     private fun loadCjkFont(): Font {
         val candidates = linkedSetOf<String>()
         System.getProperty("dreamdisplayx.fontFile")?.trim()?.takeIf { it.isNotEmpty() }?.let(candidates::add)
+        System.getenv("WINDIR")?.trim()?.takeIf { it.isNotEmpty() }?.let { windowsDir ->
+            candidates += "$windowsDir/Fonts/msyh.ttc"
+            candidates += "$windowsDir/Fonts/msyhbd.ttc"
+        }
         candidates += listOf(
             "/system/fonts/NotoSansCJK-Regular.ttc",
             "/system/fonts/NotoSansCJKsc-Regular.otf",

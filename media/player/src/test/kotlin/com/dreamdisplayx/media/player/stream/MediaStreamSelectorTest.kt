@@ -47,4 +47,27 @@ class MediaStreamSelectorTest {
     fun knownQualityStillUsesCanonicalDecoderDimensions() {
         assertEquals(1920 to 1080, MediaStreamSelector.targetDimensions(null, 1080, 2560 to 1440))
     }
+
+    @Test
+    fun defaultDolbyAudioWinsOverHigherBitrateAac() {
+        val aac = MediaStream(
+            url = "https://media.example/aac-192k.m4s",
+            type = MediaStreamType.AUDIO,
+            codec = "mp4a.40.2",
+            width = null,
+            height = null,
+            fps = null,
+            bitrate = 192_000,
+            audioTrackName = "AAC 192K",
+            audioTrackLang = null,
+        )
+        val dolby = aac.copy(
+            url = "https://media.example/dolby.m4s",
+            bitrate = 128_000,
+            audioTrackName = "Dolby",
+            isDefault = true,
+        )
+
+        assertEquals(dolby, MediaStreamSelector.pickAudio(listOf(aac, dolby), "", null))
+    }
 }

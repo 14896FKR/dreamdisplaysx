@@ -64,6 +64,21 @@ data class MediaSearchResult(
 
     /** Bilibili access mode: null=free, "vip", or "paid". Drives the VIP/付费 tag on a card. */
     val bilibiliAccess: String? = null,
+
+    /** True when Bilibili marks this as a co-authored video; drives the collab card tag. */
+    val bilibiliUnionVideo: Boolean = false,
+
+    /** True for an uploader (UP) search card; clicking it opens that uploader's video list. */
+    val isUploader: Boolean = false,
+
+    /** Bilibili uploader mid for an uploader card or a video returned from an uploader page. */
+    val uploaderId: Long? = null,
+
+    /** Follower count shown on an uploader card. */
+    val uploaderFans: Long? = null,
+
+    /** Video count shown on an uploader card. */
+    val uploaderVideoCount: Long? = null,
 ) {
     /** True when thumbnail can be derived from [id] as YouTube image (real YouTube results only). */
     val isYouTubeResult: Boolean get() = !isCustom && !isTwitch && platform == MediaPlatform.YOUTUBE

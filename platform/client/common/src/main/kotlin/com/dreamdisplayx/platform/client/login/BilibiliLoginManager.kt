@@ -1,7 +1,12 @@
 package com.dreamdisplayx.platform.client.login
 
+import com.dreamdisplayx.media.source.bilibili.BilibiliApi
 import com.dreamdisplayx.media.source.bilibili.BilibiliAuth
 import com.dreamdisplayx.media.source.bilibili.BilibiliAuth.PollResult
+import com.dreamdisplayx.platform.client.displays.DisplayRegistry
+import com.dreamdisplayx.platform.client.managers.ClientStateManager
+import com.dreamdisplayx.platform.client.ui.widgets.BilibiliAccountLabel
+import com.dreamdisplayx.util.BilibiliCookie
 import net.minecraft.client.Minecraft
 import org.slf4j.LoggerFactory
 
@@ -93,23 +98,50 @@ object BilibiliLoginManager {
         qrContent = null
         // Clear local session state so the account is fully forgotten on this client too,
         // even if the server command is somehow not delivered.
-        com.dreamdisplayx.media.source.bilibili.BilibiliAuth.refreshToken = ""
-        com.dreamdisplayx.platform.client.managers.ClientStateManager.bilibiliSessdata = ""
+        BilibiliAuth.refreshToken = ""
+        BilibiliApi.cookie = ""
+        ClientStateManager.bilibiliSessdata = ""
+        BilibiliAccountLabel.invalidate()
         sendServerCommand("display logout bilibili")
         status = "正在退出登录..." // overwritten by the server response / client clear
+    }
+
+    /** Sends a manually supplied cookie to the server; accepts a raw header or browser JSON. */
+    fun loginWithCookie(raw: String) {
+        val cookie = BilibiliCookie.parse(raw)
+        if (!BilibiliCookie.hasSession(cookie)) {
+            status = "Cookie 中没有可用的 SESSDATA"
+            return
+        }
+        // Apply locally first; the server command is only the global sync path.
+        applyLocalCredential(cookie)
+        if (Minecraft.getInstance().connection == null) {
+            status = "Cookie 已应用到本地；当前未连接服务器"
+            return
+        }
+        sendServerCommand("display login bilibili $cookie")
+        status = "Cookie 已应用到本地，正在同步到服务器"
+        logger.info("Manual Bilibili cookie applied locally and sent to the server (length={}).", cookie.length)
+    }
+
+    /** Applies the cookie immediately so playback does not wait for the server round-trip. */
+    private fun applyLocalCredential(cookie: String) {
+        BilibiliApi.cookie = cookie
+        ClientStateManager.bilibiliSessdata = cookie
+        BilibiliAccountLabel.invalidate()
+        DisplayRegistry.screens.values.forEach { it.reloadQuality() }
     }
 
     private fun completeLogin(sessdata: String, refreshToken: String = "") {
         loggedIn = true
         _qrKey = null
         qrContent = null
+        applyLocalCredential(sessdata)
         // Send the refresh token along so the server can renew the session when it expires.
         val credential = if (refreshToken.isNotEmpty()) "$sessdata||$refreshToken" else sessdata
         sendServerCommand("display login bilibili $credential")
-        // Note: quality refresh happens on receipt of PlatformCredentials packet from the server,
-        // which echoes back the credential and sets BilibiliApi.cookie locally.
-        status = "登录成功！凭据已加密保存到服务器"
-        logger.info("Bilibili login succeeded; SESSDATA sent to the server (refresh token included={}).", refreshToken.isNotEmpty())
+        status = "登录成功！凭据已应用到本地，正在同步到服务器"
+        logger.info("Bilibili login succeeded; cookie applied locally and sent to the server (refresh token included={}).", refreshToken.isNotEmpty())
         // Close the login screen on the client thread.
         onLoginSuccess?.invoke()
     }

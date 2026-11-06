@@ -32,6 +32,15 @@ abstract class UiScreenBase(title: Component) : Screen(title) {
     protected var uiScale: Double = 1.0
         private set
 
+    /**
+     * Hides every registered widget except [keep]. Used while a modal panel (the error panel) owns
+     * the screen: a control that no layout pass placed would otherwise be painted at its stale
+     * geometry, which is how a slider-sized frame ended up in the screen corner.
+     */
+    protected fun hideWidgetsExcept(keep: Collection<UiWidget>) {
+        for (widget in uiWidgets) widget.visible = widget in keep
+    }
+
     /** Registers [w] as a renderable, interactive child and includes it in the per-frame state sync. */
     protected fun <T : UiWidget> addUi(w: T): T {
         uiWidgets.add(w)

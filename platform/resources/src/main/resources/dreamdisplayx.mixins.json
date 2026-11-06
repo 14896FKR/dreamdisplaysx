@@ -4,11 +4,18 @@
   "package": "com.dreamdisplayx.platform.client.mixins",
   "compatibilityLevel": "JAVA_${javaVersion}",
   "client": [
+    "BorderlessChatWord",
+    "BorderlessKeyboardCapture",
+    "BorderlessMouseLock",
+    "BorderlessMovementLock",
     "Crosshair",
     "DebugScreenDebugInfo",
     "DisplayLatePass",
+    "EditBoxCaretHold",
     "HudSuppress",
+    "JadeOverlaySuppress",
     "ScreenOverlay",
+    "SodiumExtraHudSuppress",
     "SoundOptionsScreenMixin"
   ],
   "injectors": {

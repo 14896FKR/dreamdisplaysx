@@ -46,6 +46,8 @@ class BiliDmSegParserTest {
         content: String? = null,
         pool: Int? = null,
         idStr: String? = null,
+        midHash: String? = null,
+        colorful: Int? = null,
     ): ByteArray {
         val out = ArrayList<Byte>()
         fun append(bytes: ByteArray) = out.addAll(bytes.toList())
@@ -54,9 +56,11 @@ class BiliDmSegParserTest {
         mode?.let { append(fieldVarint(3, it.toLong())) }
         fontSize?.let { append(fieldVarint(4, it.toLong())) }
         color?.let { append(fieldVarint(5, it.toLong())) }
+        midHash?.let { append(fieldBytes(6, text(it))) }
         content?.let { append(fieldBytes(7, text(it))) }
         pool?.let { append(fieldVarint(11, it.toLong())) }
         idStr?.let { append(fieldBytes(12, text(it))) }
+        colorful?.let { append(fieldVarint(24, it.toLong())) }
         return out.toByteArray()
     }
 
@@ -78,6 +82,7 @@ class BiliDmSegParserTest {
             elem(
                 id = 1001, progress = 2500, mode = 1, fontSize = 25, color = 0xFFFFFF,
                 content = "Hello danmaku", pool = 0, idStr = "abc123",
+                midHash = "sender1", colorful = 60001,
             ),
             elem(id = 1002, progress = 5000, mode = 5, fontSize = 30, color = 0xFF0000, content = "固定顶部"),
         )
@@ -92,6 +97,8 @@ class BiliDmSegParserTest {
         assertEquals(0xFFFFFF, first.color)
         assertEquals("Hello danmaku", first.content)
         assertEquals("abc123", first.idStr)
+        assertEquals("sender1", first.midHash)
+        assertTrue(first.colorful)
         assertTrue(first.rolling())
         assertEquals("abc123", first.key())
 

@@ -26,12 +26,14 @@ class ModTitleLabel {
     fun draw(g: GuiGraphicsCompat, x: Int, y: Int) {
         val font = Minecraft.getInstance().font
         val name = literalText("Dream DisplaysX")
-        val ver = literalText(" ${GeneralUtil.getPrettyModVersion()}")
+        val nameW = font.width(name)
+        val ver = literalText(GeneralUtil.getPrettyModVersion())
             .withStyle(Style.EMPTY.withColor(UiTheme.ACCENT_VERSION))
-        val label = name.copy().append(ver)
-        g.drawText(font, label, x, y, UiTheme.TEXT_PRIMARY, true)
+        // Version sits a few pixels right of the name instead of touching it.
+        g.drawText(font, name, x, y, UiTheme.TEXT_PRIMARY, true)
+        g.drawText(font, ver, x + nameW + VERSION_GAP, y, UiTheme.TEXT_PRIMARY, true)
 
-        val textW = font.width(label)
+        val textW = nameW + VERSION_GAP + font.width(ver)
         var totalW = textW
         if (UpdateCheck.shouldShowArrow()) {
             val t = ((System.currentTimeMillis() - openedAtMs) % 1800L) / 1800f
@@ -64,5 +66,8 @@ class ModTitleLabel {
 
     companion object {
         private const val MODRINTH_URL = "https://github.com/Aruvelut-123/dreamdisplaysx/releases"
+
+        /** Gap between the mod name and its version. */
+        private const val VERSION_GAP = 6
     }
 }

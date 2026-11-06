@@ -2,13 +2,29 @@ package com.dreamdisplayx.platform.client.config
 
 import com.dreamdisplayx.api.media.audio.model.AcousticQuality
 import com.dreamdisplayx.media.player.cdn.BilibiliCdnMirror
+import com.dreamdisplayx.platform.client.Config
+import com.dreamdisplayx.platform.client.danmaku.DanmakuBlocklistImporter
+import com.dreamdisplayx.platform.client.login.BilibiliLoginManager
 import com.dreamdisplayx.platform.client.managers.ClientStartupManager
 import com.dreamdisplayx.platform.client.managers.ClientStateManager
+import com.dreamdisplayx.util.BilibiliCookie
 import me.shedaniel.clothconfig2.api.ConfigBuilder
 import me.shedaniel.clothconfig2.api.ConfigCategory
 import me.shedaniel.clothconfig2.api.ConfigEntryBuilder
+import me.shedaniel.clothconfig2.gui.entries.StringListEntry
+import me.shedaniel.clothconfig2.gui.entries.TooltipListEntry
+import net.minecraft.client.Minecraft
+import net.minecraft.client.gui.GuiGraphics
+import net.minecraft.client.gui.components.Button
+import net.minecraft.client.gui.components.events.GuiEventListener
+import net.minecraft.client.gui.narration.NarratableEntry
 import net.minecraft.client.gui.screens.Screen
 import net.minecraft.network.chat.Component
+import java.awt.FileDialog
+import java.awt.Frame
+import java.io.File
+import java.util.Optional
+import java.util.function.Supplier
 
 /**
  * Cloth Config screen for NeoForge — mirrors the Fabric [ClothConfigScreenProvider] exactly
@@ -44,6 +60,18 @@ internal object NeoForgeClothConfigScreen {
                 .setDefaultValue(true)
                 .setTooltip(Component.translatable(ConfigScreenText.Keys.DISPLAYS_ENABLED_TOOLTIP))
                 .setSaveConsumer { v: Boolean -> config.displaysEnabled = v }
+                .build(),
+        )
+
+        val autoPlayEntry = config.configEntries().single { it.key == "auto-play-on-join" }
+        general.addEntry(
+            entryBuilder.startBooleanToggle(
+                ConfigScreenText.entryLabel(autoPlayEntry),
+                config.autoPlayOnJoin,
+            )
+                .setDefaultValue(false)
+                .setTooltip(ConfigScreenText.entryTooltip(autoPlayEntry))
+                .setSaveConsumer { v: Boolean -> config.autoPlayOnJoin = v }
                 .build(),
         )
 
@@ -106,6 +134,34 @@ internal object NeoForgeClothConfigScreen {
                 .setDefaultValue(false)
                 .setTooltip(Component.translatable(ConfigScreenText.Keys.MUTE_ON_ALT_TAB_TOOLTIP))
                 .setSaveConsumer { v: Boolean -> config.muteOnAltTab = v }
+                .build(),
+        )
+
+        // Borderless console (enable + caret mode), same rows as the Fabric screen
+        val borderlessConsoleEntry = config.configEntries().single { it.key == "borderless-console" }
+        general.addEntry(
+            entryBuilder.startBooleanToggle(
+                ConfigScreenText.entryLabel(borderlessConsoleEntry),
+                config.borderlessConsole,
+            )
+                .setDefaultValue(false)
+                .setTooltip(ConfigScreenText.entryTooltip(borderlessConsoleEntry))
+                .setSaveConsumer { v: Boolean -> config.borderlessConsole = v }
+                .build(),
+        )
+
+        val consoleCaretEntry = config.configEntries().single { it.key == "borderless-console-caret" }
+        val caretValues = Config.CONSOLE_CARET_MODES.toTypedArray()
+        general.addEntry(
+            entryBuilder.startSelector(
+                ConfigScreenText.entryLabel(consoleCaretEntry),
+                caretValues,
+                config.borderlessConsoleCaret.takeIf { it in caretValues } ?: Config.CONSOLE_CARET_SOLID,
+            )
+                .setDefaultValue(Config.CONSOLE_CARET_SOLID)
+                .setNameProvider { v -> ConfigScreenText.caretLabel(v) }
+                .setTooltip(ConfigScreenText.entryTooltip(consoleCaretEntry))
+                .setSaveConsumer { v: String -> config.borderlessConsoleCaret = v }
                 .build(),
         )
 
@@ -175,6 +231,158 @@ internal object NeoForgeClothConfigScreen {
                 .build(),
         )
 
+        val mergeDanmakuEntry = config.configEntries().single { it.key == "danmaku-merge-duplicates" }
+        general.addEntry(
+            entryBuilder.startBooleanToggle(
+                ConfigScreenText.entryLabel(mergeDanmakuEntry),
+                config.danmakuMergeDuplicates,
+            )
+                .setDefaultValue(true)
+                .setTooltip(ConfigScreenText.entryTooltip(mergeDanmakuEntry))
+                .setSaveConsumer { v: Boolean -> config.danmakuMergeDuplicates = v }
+                .build(),
+        )
+
+        val colorfulDanmakuEntry = config.configEntries().single { it.key == "danmaku-show-colorful" }
+        general.addEntry(
+            entryBuilder.startBooleanToggle(
+                ConfigScreenText.entryLabel(colorfulDanmakuEntry),
+                config.danmakuShowColorful,
+            )
+                .setDefaultValue(true)
+                .setTooltip(ConfigScreenText.entryTooltip(colorfulDanmakuEntry))
+                .setSaveConsumer { v: Boolean -> config.danmakuShowColorful = v }
+                .build(),
+        )
+
+        val blockWordsEntry = config.configEntries().single { it.key == "danmaku-block-words" }
+        val blockWordsField = entryBuilder.startStrField(
+            ConfigScreenText.entryLabel(blockWordsEntry),
+            DanmakuBlocklistImporter.toSingleLine(config.danmakuBlockWords),
+        )
+            .setDefaultValue("")
+            .setTooltip(ConfigScreenText.entryTooltip(blockWordsEntry))
+            .setSaveConsumer { v: String -> config.danmakuBlockWords = v }
+            .build()
+        general.addEntry(blockWordsField)
+        general.addEntry(DanmakuImportButtonEntry { importDanmakuBlocklist(config, blockWordsField) })
+
+        // Manual Bilibili cookie; sent to the server on Save and never persisted client-side.
+        general.addEntry(
+            entryBuilder.startStrField(
+                Component.translatableWithFallback(ConfigScreenText.Keys.BILIBILI_COOKIE, "Bilibili Cookie"),
+                "",
+            )
+                .setDefaultValue("")
+                .setTooltip(
+                    Component.translatableWithFallback(
+                        ConfigScreenText.Keys.BILIBILI_COOKIE_TOOLTIP,
+                        "Paste a Bilibili cookie header or JSON, then Save. Requires OP; the value is not stored in the client config.",
+                    ),
+                )
+                .setErrorSupplier { raw: String ->
+                    if (raw.isBlank() || BilibiliCookie.hasSession(raw)) Optional.empty<Component>()
+                    else Optional.of(
+                        Component.translatableWithFallback(
+                            ConfigScreenText.Keys.BILIBILI_COOKIE_INVALID,
+                            "Cookie has no SESSDATA.",
+                        ),
+                    )
+                }
+                .setSaveConsumer { raw: String ->
+                    if (raw.isNotBlank()) BilibiliLoginManager.loginWithCookie(raw)
+                }
+                .build(),
+        )
+
         return builder.build()
     }
+}
+
+private fun importDanmakuBlocklist(config: Config, field: StringListEntry) {
+    val dialog = FileDialog(null as Frame?, Component.translatable(ConfigScreenText.Keys.DANMAKU_IMPORT).string, FileDialog.LOAD)
+    dialog.isVisible = true
+    val directory = dialog.directory ?: return
+    val selectedName = dialog.file ?: return
+    runCatching {
+        DanmakuBlocklistImporter.importFile(File(directory, selectedName), config.danmakuBlockWords)
+    }.onSuccess { result ->
+        if (result.added > 0) {
+            val singleLine = DanmakuBlocklistImporter.toSingleLine(result.updatedRaw)
+            config.danmakuBlockWords = singleLine
+            config.save()
+            field.setValue(singleLine)
+        }
+        showImportMessage(
+            Component.translatableWithFallback(
+                ConfigScreenText.Keys.DANMAKU_IMPORT_RESULT,
+                "Imported %s rules; skipped %s disabled, %s UID, %s duplicate, %s invalid.",
+                result.added,
+                result.skippedDisabled,
+                result.skippedUid,
+                result.skippedDuplicate,
+                result.skippedInvalid,
+            ),
+        )
+    }.onFailure { error ->
+        showImportMessage(
+            Component.translatableWithFallback(
+                ConfigScreenText.Keys.DANMAKU_IMPORT_ERROR,
+                "Import failed: %s",
+                error.message ?: "unknown error",
+            ),
+        )
+    }
+}
+
+private fun showImportMessage(message: Component) {
+    Minecraft.getInstance().player?.displayClientMessage(message, false)
+}
+
+private class DanmakuImportButtonEntry(private val onPress: () -> Unit) : TooltipListEntry<Boolean>(
+    Component.empty(),
+    Supplier {
+        Optional.of(
+            arrayOf<Component>(
+                Component.translatable(ConfigScreenText.Keys.DANMAKU_IMPORT_TOOLTIP),
+            ),
+        )
+    },
+) {
+    private val button = Button.builder(
+        Component.translatable(ConfigScreenText.Keys.DANMAKU_IMPORT),
+        { _: Button -> onPress() },
+    ).bounds(0, 0, 160, 20).build()
+
+    override fun getValue(): Boolean = false
+
+    override fun getDefaultValue(): Optional<Boolean> = Optional.empty()
+
+    override fun children(): MutableList<GuiEventListener> = mutableListOf(button)
+
+    override fun getItemHeight(): Int = 24
+
+    override fun render(
+        guiGraphics: GuiGraphics,
+        index: Int,
+        y: Int,
+        x: Int,
+        entryWidth: Int,
+        entryHeight: Int,
+        mouseX: Int,
+        mouseY: Int,
+        isHovered: Boolean,
+        delta: Float,
+    ) {
+        button.x = x
+        button.y = y + 2
+        button.width = entryWidth
+        button.height = 20
+        button.render(guiGraphics, mouseX, mouseY, delta)
+    }
+
+    override fun mouseClicked(mouseX: Double, mouseY: Double, button: Int): Boolean =
+        this.button.mouseClicked(mouseX, mouseY, button)
+
+    override fun narratables(): List<NarratableEntry> = listOf(this.button)
 }

@@ -34,8 +34,23 @@ class Config(private val baseDir: File) {
     /** Whether displays are enabled at all. */
     var displaysEnabled: Boolean = true
 
+    /** Whether LOCAL displays start playing automatically when the world loads. */
+    var autoPlayOnJoin: Boolean = false
+
     /** Whether video loading uses the optional logo intro, rainbow waving title, and spinner. */
     var animatedLoadingScreen: Boolean = false
+
+    /**
+     * Whether Borderless starts with the playback console enabled. When off, typing `Dev` in chat while
+     * a Borderless video is up turns it on for the session.
+     */
+    var borderlessConsole: Boolean = false
+
+    /**
+     * How the Borderless console caret behaves: [CONSOLE_CARET_BLINK], [CONSOLE_CARET_SOLID] (default,
+     * a blinking caret sometimes vanished on video) or [CONSOLE_CARET_OFF].
+     */
+    var borderlessConsoleCaret: String = CONSOLE_CARET_SOLID
 
     /** Whether Dream DisplaysX HUD overlays are rendered during replay/export. */
     var flashbackRenderHud: Boolean = true
@@ -88,9 +103,9 @@ class Config(private val baseDir: File) {
     var danmakuRollingRangePercent: Int = 50
         set(value) { field = if (value in setOf(25, 50, 75, 100)) value else 50 }
 
-    /** Danmaku text scale in percent, 50 .. 170. */
+    /** Danmaku text scale in percent, 25 .. 170. */
     var danmakuScalePercent: Int = 100
-        set(value) { field = value.coerceIn(50, 170) }
+        set(value) { field = value.coerceIn(25, 170) }
 
     /** Danmaku text opacity in percent, 20 .. 100. */
     var danmakuOpacity: Int = 100
@@ -107,6 +122,15 @@ class Config(private val baseDir: File) {
 
     /** Keeps fixed-bottom danmaku clear of the bottom edge by capping the rolling range at 85%. */
     var danmakuBottomGuard: Boolean = true
+
+    /** Merge identical danmaku content and show a `(count)` prefix like PiliPlus. */
+    var danmakuMergeDuplicates: Boolean = true
+
+    /** Show Bilibili VIP gradual-color danmaku with the pink-to-blue gradient. */
+    var danmakuShowColorful: Boolean = true
+
+    /** Comma/newline/semicolon separated danmaku block words; `/regex/` entries are regexes. */
+    var danmakuBlockWords: String = ""
 
     init {
         load()
@@ -170,6 +194,7 @@ class Config(private val baseDir: File) {
         data["default-render-distance"]?.toIntOrNull()?.let { defaultDistance = ((it / 16.0).roundToInt().coerceIn(2, 12)) * 16 }
         data["default-default-display-volume"]?.toDoubleOrNull()?.let { defaultDisplayVolume = it }
         data["displays-enabled"]?.toBooleanStrictOrNull()?.let { displaysEnabled = it }
+        data["auto-play-on-join"]?.toBooleanStrictOrNull()?.let { autoPlayOnJoin = it }
         animatedLoadingScreen = data["animated-loading-screen"]?.toBooleanStrictOrNull() ?: false
         data["use-hw-accel"]?.toBooleanStrictOrNull()?.let { useHwAccel = it }
         data["prefer-fps60"]?.toBooleanStrictOrNull()?.let { preferFps60 = it }
@@ -191,7 +216,16 @@ class Config(private val baseDir: File) {
         }
         t?.getDouble("default-display-volume")?.let { defaultDisplayVolume = it }
         displaysEnabled = t?.getBoolean("displays-enabled") ?: displaysEnabled
+        autoPlayOnJoin = t?.getBoolean("auto-play-on-join") ?: autoPlayOnJoin
         animatedLoadingScreen = t?.get("animated-loading-screen") as? Boolean ?: false
+        borderlessConsole = t?.getBoolean("borderless-console") ?: borderlessConsole
+        // The old boolean only knew blink / solid; keep reading it so an existing config still works.
+        t?.getBoolean("borderless-console-cursor-blink")?.let { blink ->
+            borderlessConsoleCaret = if (blink) CONSOLE_CARET_BLINK else CONSOLE_CARET_SOLID
+        }
+        t?.getString("borderless-console-caret")?.takeIf { it in CONSOLE_CARET_MODES }?.let {
+            borderlessConsoleCaret = it
+        }
         flashbackRenderHud = t?.getBoolean("flashback-render-hud") ?: flashbackRenderHud
         flashbackRenderDisplays = t?.getBoolean("flashback-render-displays") ?: flashbackRenderDisplays
         t?.getDouble("global-audio-multiplier")?.let { globalAudioMultiplier = it.coerceIn(0.0, 2.0) }
@@ -211,6 +245,9 @@ class Config(private val baseDir: File) {
         danmakuBlockFixed = t?.getBoolean("danmaku-block-fixed") ?: danmakuBlockFixed
         danmakuBlockColored = t?.getBoolean("danmaku-block-colored") ?: danmakuBlockColored
         danmakuBottomGuard = t?.getBoolean("danmaku-bottom-guard") ?: danmakuBottomGuard
+        danmakuMergeDuplicates = t?.getBoolean("danmaku-merge-duplicates") ?: danmakuMergeDuplicates
+        danmakuShowColorful = t?.getBoolean("danmaku-show-colorful") ?: danmakuShowColorful
+        danmakuBlockWords = t?.getString("danmaku-block-words") ?: danmakuBlockWords
         when (t?.getString("audio-output-profile")?.lowercase()) {
             "speakers" -> audioBinauralOutput = false
             "headphones", "auto" -> audioBinauralOutput = true
@@ -226,6 +263,14 @@ class Config(private val baseDir: File) {
      * Declarative list of every editable setting, so the config screen can render controls (and their
      * comments) from this definition instead of hand-writing a row per field.
      */
+    /** Borderless console caret modes; the strings are the persisted values. */
+    companion object {
+        const val CONSOLE_CARET_BLINK = "blink"
+        const val CONSOLE_CARET_SOLID = "solid"
+        const val CONSOLE_CARET_OFF = "off"
+        val CONSOLE_CARET_MODES = listOf(CONSOLE_CARET_SOLID, CONSOLE_CARET_OFF, CONSOLE_CARET_BLINK)
+    }
+
     fun configEntries(): List<ConfigEntry<*>> = listOf(
         ConfigEntry(
             "displays-enabled", "Displays enabled",
@@ -235,11 +280,32 @@ class Config(private val baseDir: File) {
             apply = { displaysEnabled = it; save() },
         ),
         ConfigEntry(
+            "auto-play-on-join", "Auto-play on world join",
+            "Start LOCAL displays automatically when the world loads. When off, they stay paused at the saved position.",
+            ConfigEntryType.BOOLEAN,
+            get = { autoPlayOnJoin },
+            apply = { autoPlayOnJoin = it; save() },
+        ),
+        ConfigEntry(
             "animated-loading-screen", "Animated loading screen",
             "Show a logo intro, rainbow waving title, and spinner while a video is loading.",
             ConfigEntryType.BOOLEAN,
             get = { animatedLoadingScreen },
             apply = { animatedLoadingScreen = it; save() },
+        ),
+        ConfigEntry(
+            "borderless-console", "Borderless console",
+            "Start Borderless with the playback console enabled. When off, type `Dev` in chat while a Borderless video is open to turn it on.",
+            ConfigEntryType.BOOLEAN,
+            get = { borderlessConsole },
+            apply = { borderlessConsole = it; save() },
+        ),
+        ConfigEntry(
+            "borderless-console-caret", "Console caret",
+            "How the Borderless console caret behaves: solid, off, or blinking.",
+            ConfigEntryType.STRING,
+            get = { borderlessConsoleCaret },
+            apply = { borderlessConsoleCaret = it; save() },
         ),
         ConfigEntry(
             "flashback-render-hud", "Flashback HUD rendering",
@@ -342,7 +408,7 @@ class Config(private val baseDir: File) {
         ),
         ConfigEntry(
             "danmaku-scale-percent", "Danmaku scale",
-            "Danmaku text scale in percent, 50 to 170.",
+            "Danmaku text scale in percent, 25 to 170.",
             ConfigEntryType.INT,
             get = { danmakuScalePercent },
             apply = { danmakuScalePercent = it; save() },
@@ -382,6 +448,27 @@ class Config(private val baseDir: File) {
             get = { danmakuBottomGuard },
             apply = { danmakuBottomGuard = it; save() },
         ),
+        ConfigEntry(
+            "danmaku-merge-duplicates", "Merge duplicate danmaku",
+            "Merge identical danmaku content and show a (count) prefix, following PiliPlus.",
+            ConfigEntryType.BOOLEAN,
+            get = { danmakuMergeDuplicates },
+            apply = { danmakuMergeDuplicates = it; save() },
+        ),
+        ConfigEntry(
+            "danmaku-show-colorful", "Show colorful danmaku",
+            "Render Bilibili VIP gradual-color danmaku with the pink-to-blue gradient.",
+            ConfigEntryType.BOOLEAN,
+            get = { danmakuShowColorful },
+            apply = { danmakuShowColorful = it; save() },
+        ),
+        ConfigEntry(
+            "danmaku-block-words", "Danmaku block words",
+            "Comma or semicolon separated words; one rule per line is also accepted. Wrap regex rules in /slashes/.",
+            ConfigEntryType.STRING,
+            get = { danmakuBlockWords },
+            apply = { danmakuBlockWords = it; save() },
+        ),
     )
 
     /** Persists the current configuration values to disk as standard TOML. */
@@ -396,7 +483,10 @@ class Config(private val baseDir: File) {
             appendLine("default-render-distance = $defaultDistance")
             appendLine("default-display-volume = $defaultDisplayVolume")
             appendLine("displays-enabled = $displaysEnabled")
+            appendLine("auto-play-on-join = $autoPlayOnJoin")
             appendLine("animated-loading-screen = $animatedLoadingScreen")
+            appendLine("borderless-console = $borderlessConsole")
+            appendLine("borderless-console-caret = \"$borderlessConsoleCaret\"")
             appendLine("flashback-render-hud = $flashbackRenderHud")
             appendLine("flashback-render-displays = $flashbackRenderDisplays")
             appendLine("global-audio-multiplier = $globalAudioMultiplier")
@@ -415,6 +505,9 @@ class Config(private val baseDir: File) {
             appendLine("danmaku-block-fixed = $danmakuBlockFixed")
             appendLine("danmaku-block-colored = $danmakuBlockColored")
             appendLine("danmaku-bottom-guard = $danmakuBottomGuard")
+            appendLine("danmaku-merge-duplicates = $danmakuMergeDuplicates")
+            appendLine("danmaku-show-colorful = $danmakuShowColorful")
+            appendLine("danmaku-block-words = \"${tomlQuote(danmakuBlockWords)}\"")
         })
     }
 

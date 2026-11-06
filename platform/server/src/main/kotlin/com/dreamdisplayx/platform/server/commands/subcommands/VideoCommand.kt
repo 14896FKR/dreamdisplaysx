@@ -2,6 +2,7 @@ package com.dreamdisplayx.platform.server.commands.subcommands
 
 import com.dreamdisplayx.platform.client.utils.literalText
 import com.dreamdisplayx.platform.server.ModLoaderOnly
+import com.dreamdisplayx.api.media.source.url.BilibiliUrls
 import com.dreamdisplayx.api.media.source.url.YouTubeUrls
 import com.dreamdisplayx.api.media.source.url.CustomMediaUrls
 import com.dreamdisplayx.api.playback.policy.PlaybackPermissions
@@ -133,6 +134,7 @@ private fun canonicalUrl(raw: String): String? {
     val input = raw.trim()
     if (input.isEmpty()) return null
     YouTubeUrls.extractVideoIdTyped(input)?.let { return YouTubeUrls.watchUrl(it) }
+    BilibiliUrls.parse(input)?.let { return it.url.takeIf { url -> MediaUrlPolicy.isAllowed(url) } }
     val normalized = CustomMediaUrls.normalize(input) ?: return null
     return normalized.takeIf { MediaUrlPolicy.isAllowed(it) }
 }

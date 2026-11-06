@@ -43,13 +43,35 @@ class AudioRenderChainTest {
     }
 
     @Test
-    fun `bypassSpatial (popout) also applies the legacy gain`() {
-        val chain = newChain()
+    fun `bypassSpatial keeps the legacy gain on tiers without loudness normalisation`() {
+        val chain = newChain(quality = AcousticQuality.BASIC)
         chain.updateState(defaultState(bypassSpatial = true))
         val buf = frame(9000, -9000)
         val expected = expectedLegacyGain(buf, 1.2)
         chain.process(buf, buf.size, 1.2)
         assertEquals(expected.toList(), buf.toList())
+    }
+
+    @Test
+    fun `bypassSpatial normalises loudness on the advanced tier`() {
+        val chain = newChain()
+        chain.updateState(defaultState(bypassSpatial = true))
+        // A quiet source must come back louder once the makeup gain has slewed in, and never clip.
+        repeat(200) {
+            val buf = ByteArray(4410 * 4)
+            for (i in 0 until 4410) {
+                val v = (Short.MAX_VALUE * 0.02 * kotlin.math.sin(i * 0.05)).toInt().toShort()
+                val f = frame(v, v)
+                System.arraycopy(f, 0, buf, i * 4, 4)
+            }
+            chain.process(buf, buf.size, 1.0)
+            for (i in 0 until 4410) {
+                val lo = buf[i * 4].toInt() and 0xFF
+                val hi = buf[i * 4 + 1].toInt()
+                val s = ((hi shl 8) or lo)
+                assertTrue(s in -32768..32767, "Sample out of S16 range: $s.")
+            }
+        }
     }
 
     @Test

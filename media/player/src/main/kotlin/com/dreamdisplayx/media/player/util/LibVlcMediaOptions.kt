@@ -25,8 +25,18 @@ object LibVlcMediaOptions {
      * libvlc default is not browser-shaped and is rejected by several CDNs); the
      * `Referer` is added only when [MediaHosts] knows a platform referer for it.
      */
-    fun forUrl(url: String): Array<String> {
+    fun forUrl(url: String, live: Boolean = false): Array<String> {
         val options = mutableListOf(":http-user-agent=$BROWSER_USER_AGENT")
+        if (url.startsWith("http://") || url.startsWith("https://")) {
+            // Re-open the HTTP input after an unexpected CDN disconnect instead of ending the stream.
+            options.add(":http-reconnect")
+        }
+        if (live) {
+            // Live has nothing to sync against, so the clock machinery only adds latency: no jitter
+            // compensation and no clock synchronisation is what VLC's own low-latency preset does.
+            options.add(":clock-jitter=0")
+            options.add(":clock-synchro=0")
+        }
         MediaHosts.refererFor(url)?.let { referer ->
             // VLC 3.0 option name: http-referrer (double r).
             options.add(":http-referrer=$referer")

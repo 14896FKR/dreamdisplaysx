@@ -1,5 +1,6 @@
 package com.dreamdisplayx.media.source.bilibili
 
+import com.dreamdisplayx.util.BilibiliCookie
 import com.dreamdisplayx.util.asJsonObjectOrNull
 import com.dreamdisplayx.util.obj
 import com.dreamdisplayx.util.optInt
@@ -78,8 +79,11 @@ object BilibiliAuth {
 
     /** Polls a QR login session; returns the outcome, including the `SESSDATA` once confirmed. */
     fun pollQrCode(qrcodeKey: String): PollResult {
-        val root = getJson("https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=$qrcodeKey")
-        val data = root?.obj("data")
+        val response = getJsonWithHeaders(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=$qrcodeKey"
+        ) ?: return PollResult.Pending
+        val root = response.json
+        val data = root.obj("data")
         // The QR-login status lives in `data.code`, NOT the top-level `code` (which is the HTTP
         // layer status and is 0 for every successful request). Reading the top-level code made us
         // treat "not yet scanned" (86101) and "scanned, awaiting confirmation" (86090) as success.
@@ -96,8 +100,13 @@ object BilibiliAuth {
         }
         return when (statusCode) {
             0 -> {
-                val cookie = data?.let { extractBilibiliCookie(it) }
-                    ?: data?.optString("url")?.let { url -> fetchCrossDomainCookies(url) }
+                // The poll response itself may carry the login cookies in Set-Cookie headers.
+                // Fall back to the redirect/cross-domain URL for older flows.
+                val cookie = BilibiliCookie.merge(
+                    cookieFromHeaders(response.headers),
+                    data?.let { extractBilibiliCookie(it) },
+                    data?.optString("url")?.let { url -> fetchCrossDomainCookies(url) },
+                ).takeIf { it.isNotBlank() }
                 val refreshTokenVal = data?.optString("refresh_token").orEmpty()
                 if (cookie != null) {
                     logger.debug("QR login succeeded, cookie extracted (len={})", cookie.length)
@@ -166,18 +175,8 @@ object BilibiliAuth {
     private fun extractBilibiliCookie(data: JsonObject): String? {
         // Preferred: a `cookies` object like {"SESSDATA": "...", "bili_jct": "...", "DedeUserID": "..."}
         data.obj("cookies")?.let { cookies ->
-            val parts = mutableListOf<String>()
-            for (key in listOf("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5")) {
-                val value = cookies.optString(key)
-                if (!value.isNullOrEmpty()) parts += "$key=$value"
-            }
-            // A login is only useful once we actually hold the SESSDATA. If the response only carried
-            // auxiliary cookies (bili_jct, DedeUserID...) without SESSDATA, treat it as a failed
-            // extraction instead of returning a broken cookie string that would claim "login success"
-            // while the resolver has nothing to authenticate with.
-            val hasSessdata = !cookies.optString("SESSDATA").isNullOrEmpty()
-            if (hasSessdata && parts.isNotEmpty()) return parts.joinToString("; ")
-            // No usable cookies object -> fall through to the redirect-URL parser.
+            val parsed = BilibiliCookie.parse(cookies.toString())
+            if (BilibiliCookie.hasSession(parsed)) return parsed
         }
 
         // Fallback: parse the redirect URL (older / third-party flows).
@@ -196,9 +195,7 @@ object BilibiliAuth {
                 val key = part.substring(0, idx)
                 val raw = part.substring(idx + 1)
                 val value = runCatching { URLDecoder.decode(raw, StandardCharsets.UTF_8) }.getOrDefault(raw)
-                if (key == "SESSDATA" || key == "bili_jct" || key == "DedeUserID" || key == "DedeUserID__ckMd5") {
-                    if (value.isNotEmpty()) cookies[key] = value
-                }
+                if (value.isNotEmpty()) cookies[key] = value
             }
             return cookies
         }
@@ -214,7 +211,7 @@ object BilibiliAuth {
             if (fromDecoded.isNotEmpty()) cookies = fromDecoded
         }
 
-        return cookies.entries.joinToString("; ") { (k, v) -> "$k=$v" }.ifEmpty { null }
+        return BilibiliCookie.parse(cookies.entries.joinToString("; ") { (k, v) -> "$k=$v" }).ifBlank { null }
     }
 
     /**
@@ -264,14 +261,19 @@ object BilibiliAuth {
                 collectCookies(follow.headers)
             }
         }
-        // Build the cookie string from the meaningful cookies.
-        val parts = allCookies.filter { cookie ->
-            cookie.substringBefore('=') in setOf("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5")
-        }
-        parts.joinToString("; ").ifEmpty { null }
+        BilibiliCookie.parse(allCookies.joinToString("; ")).ifBlank { null }
     }.onFailure { e ->
         logger.debug("Bilibili crossDomain cookie fetch failed for {}: {}.", url, e.message)
     }.getOrNull()
+
+    /** Collects login cookies from the poll response's Set-Cookie headers. */
+    private fun cookieFromHeaders(headers: Map<String, List<String>>): String? {
+        val raw = headers.entries
+            .filter { it.key.equals("Set-Cookie", ignoreCase = true) }
+            .flatMap { it.value }
+        if (raw.isEmpty()) return null
+        return BilibiliCookie.parse(raw.joinToString("; ")).ifBlank { null }
+    }
 
     /**
      * Attempts to extend the Bilibili session using the stored [refreshToken]. Returns true when the
@@ -314,14 +316,23 @@ object BilibiliAuth {
 
     private fun urlEncode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
-    /** GETs [url] as JSON, or null on failure. */
-    private fun getJson(url: String): kotlinx.serialization.json.JsonObject? = runCatching {
+    private data class JsonWithHeaders(
+        val json: JsonObject,
+        val headers: Map<String, List<String>>,
+    )
+
+    /** GETs [url] and keeps the response headers so QR login can read Set-Cookie. */
+    private fun getJsonWithHeaders(url: String): JsonWithHeaders? = runCatching {
         val response = DreamHttpClient.execute(
             url,
             DreamHttpClient.RequestOptions(headers = HEADERS, connectTimeoutMs = 10_000, readTimeoutMs = 10_000),
         )
-        DreamJson.compact.parseToJsonElement(response.bodyString()).asJsonObjectOrNull()
+        val json = DreamJson.compact.parseToJsonElement(response.bodyString()).asJsonObjectOrNull()
+            ?: return@runCatching null
+        JsonWithHeaders(json, response.headers)
     }.onFailure { logger.debug("Bilibili login GET failed for {}: {}.", url, it.message) }.getOrNull()
+
+    private fun getJson(url: String): JsonObject? = getJsonWithHeaders(url)?.json
 
     /** POSTs a URL-encoded form to [url] and parses the JSON response, or null on failure. */
     private fun postForm(url: String, form: String): kotlinx.serialization.json.JsonObject? = runCatching {

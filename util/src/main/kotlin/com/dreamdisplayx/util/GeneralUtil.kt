@@ -31,10 +31,10 @@ object GeneralUtil {
         runCatching { readResource("/assets/dreamdisplayx/commit.txt").trim() }
             .getOrDefault("unknown")
 
-    /** Formats version to human-readable label: `1.8.5-dev` -> `1.8.5 Developer`, `1.9.0-preview` -> `1.9.0 Preview`. */
+    /** Formats version to human-readable label: `1.8.5-dev` -> `1.8.5 Dev.`, `1.9.0-preview` -> `1.9.0 Preview`. */
     fun getPrettyModVersion(): String {
         val version = getModVersion()
-        DEV_VERSION.matchEntire(version)?.let { return "${it.groupValues[1]} Developer" }
+        DEV_VERSION.matchEntire(version)?.let { return "${it.groupValues[1]} Dev." }
         PREVIEW_VERSION.matchEntire(version)?.let { return "${it.groupValues[1]} Preview ${it.groupValues[2]}" }
         if (RELEASE_VERSION.matches(version)) return "$version Release"
         return version

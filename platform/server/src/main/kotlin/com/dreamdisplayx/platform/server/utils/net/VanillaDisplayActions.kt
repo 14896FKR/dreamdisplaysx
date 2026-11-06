@@ -141,6 +141,18 @@ object VanillaDisplayActions {
     fun setVideo(player: ServerPlayer, server: MinecraftServer, displayId: java.util.UUID, url: String, lang: String) {
         val displayData = DisplayManager.getDisplayData(displayId) as? VanillaDisplayData ?: return
         if (!PlaybackPermissions.canSetVideo(context(displayData, player))) return
+        // A blank URL is the explicit "clear this display" request: a viewer closed a failure panel and
+        // wants the display idle again. It skips the URL policy, which only judges real links.
+        if (url.isBlank()) {
+            if (!DisplayManager.isPlayerInRange(player, displayData)) return
+            displayData.url = ""
+            displayData.lang = ""
+            ServerCoroutines.io.launch { VanillaServerState.storage?.saveDisplay(displayData) }
+            TimelineManager.resetVideo(displayData)
+            VanillaPacketUtil.sendDisplayInfo(DisplayManager.getReceivers(displayData, server), displayData)
+            TimelineManager.broadcastCurrent(displayData)
+            return
+        }
         if (!MediaUrlPolicy.isAllowed(url)) return
         CustomMediaGate.refusalKey(
             url,

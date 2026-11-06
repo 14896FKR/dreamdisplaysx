@@ -226,6 +226,9 @@ object MediaStreamSelector {
             audioOnly.filter { matchesLanguage(it, requested) }.highestBitrate()?.let { return it }
         }
 
+        // Provider-marked default tracks win before language-neutral fallbacks; Bilibili uses this
+        // for Dolby while keeping the AAC renditions in availableAudio as recovery candidates.
+        audioOnly.filter { it.isDefault }.highestBitrate()?.let { return it }
         audioOnly.filter {
             it.audioTrackName?.lowercase()?.let { n -> "original" in n || "default" in n } == true
         }.highestBitrate()?.let { return it }

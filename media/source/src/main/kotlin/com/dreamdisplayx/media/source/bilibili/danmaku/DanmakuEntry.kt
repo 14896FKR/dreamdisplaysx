@@ -29,6 +29,12 @@ data class DanmakuEntry(
     val content: String,
     /** Pool: 0 = normal, 1 = subtitle pool. */
     val pool: Int,
+    /** Bilibili sender hash; empty for legacy XML/live messages. */
+    val midHash: String = "",
+    /** Bilibili VIP gradual-color flag (protobuf enum 60001). */
+    val colorful: Boolean = false,
+    /** Local duplicate count after merging identical content; 1 means not merged. */
+    val count: Int = 1,
 ) {
     /** True when this message has drawable content in a supported mode. */
     fun renderable(): Boolean = content.isNotBlank() && mode in 1..6

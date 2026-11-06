@@ -52,6 +52,7 @@ V3、`/display group`、Paper 远程控制棒以及 Flashback / ReplayMod 桥接
 - 沉浸式音频：3D 声音，音量最高 200%
 - 可调分辨率：按媒体源提供的档位选择，最高支持 4K；未知直链尺寸不会强制放大到 4K
 - 多音轨和多字幕：菜单可选择音频 / 字幕轨，支持双语字幕、字幕缓存和 HLS WebVTT 分段；桌面切换音轨不会重启视频画面，Android 会重建原生播放会话，并区分复用与独立音频避免重复播放
+- Bilibili 音频优先 Dolby / Dolby Atmos，Dolby 输入不可用时回退 AAC；CDN 优先使用 B 站返回的 `upos` 备份源，`mcdn` P2P 边缘源排在最后
 - 有界 HLS 主清单解析：未使用的子流保持延迟校验，异常或过大的清单不会触发串行探测风暴
 - 硬件加速：libvlc 支持 d3d11va、vaapi、videotoolbox 等后端
 - 视频动态光照：安装 LambDynamicLights 后，显示器画面可以照亮周围世界
@@ -70,6 +71,12 @@ V3、`/display group`、Paper 远程控制棒以及 Flashback / ReplayMod 桥接
 - Bilibili 扫码登录（`/dlogin`），服务器使用 AES-256-GCM 加密保存 `SESSDATA`
 - 全局 Bilibili 登录，在服务器网络内同步并广播给在线玩家，支持 LuckPerms
 - Bilibili VIP 标识、搜索、简体中文和弹幕
+- B站 UP 主搜索：按钮切换或 `@` 前缀，模糊匹配后进入完整 UP 主页（资料卡 + B站网页式视频网格）；空格保留并参与筛选
+- Borderless 与墙面显示共用距离衰减和 3D 增益，避免切换后音量跳变
+- Borderless 锁住走动与视角，并提供可选的播放控制台（聊天键开输入行，`F`/方向键/空格控制播放）
+- 退出世界再进入时，显示器从上次保存的播放位置恢复；上次为暂停时保持暂停，不自动播放
+- 弹幕屏蔽词可从 B站 JSON/XML 或 DDX TXT 导入，按内容追加去重；当前已显示弹幕不回溯
+- 预览卡片上的 UP 头像和名称可点击，直接进入该 UP 主的 B站主页
 - RTMP / RTMPS / SRT 推流输入
 - libvlc 播放引擎：通过 JNA 调用原生 libvlc，视频和音频使用独立时钟
 - Minecraft 1.21.1、1.21.11、26.1.2、26.2 和 26.3 支持
@@ -78,11 +85,50 @@ V3、`/display group`、Paper 远程控制棒以及 Flashback / ReplayMod 桥接
 
 使用黑色混凝土搭建显示器，用钻石斧选中区域并输入 `/display create`。选点过程中 Paper、Fabric 和 NeoForge 都会显示青色粒子轮廓，帮助确认选区大小；可在 `config.toml` 中设置 `display.particles = false` 关闭。创建完成后注视显示器，输入 `/display video <link> [language]`。按住 Shift 右键可以打开显示器设置菜单。
 
+## 进入世界自动播放
+
+`auto-play-on-join` 控制 LOCAL 显示器进入世界时是否自动开始播放，**默认关闭**：显示器会停在保存位置，等待手动播放。设为 `true` 后恢复自动播放。可在 Cloth Config 的 General 页切换，或编辑 `config/dreamdisplayx/config.toml`。
+
 ## 可选加载动画
 
 客户端设置 **Mods → Dream DisplaysX → Configure / Config → General → Animated loading screen** 可启用新的显示器视频加载画面，**默认关闭**，关闭时仍使用原来的加载条。设置界面需要 Cloth Config，Fabric 还需要 ModMenu；也可在游戏目录的 `config/dreamdisplayx/config.toml` 中设置 `animated-loading-screen = true` 后重启客户端。
 
 启用后图标先居中淡入，再左移并让名称向上滑入，图标与名称整体居中。名称带持续从左向右流动、无缝循环的彩虹渐变与逐字上下波浪，入场结束后在名称正下方显示 Windows 11 风格的旋转圆弧。效果适用于平面和曲面显示器；视频首帧就绪即切换播放，不会为了动画额外等待，加载错误仍使用原错误画面。
+
+## Borderless 控制台
+
+进入 Borderless（视频铺满整个画面）后会锁住走动与转视角，避免移动和转头改变 3D 音频增益、让音量忽大忽小。服务器强制广播的全屏不锁输入。
+
+按聊天键（默认 T）打开控制台输入行，样式与原版聊天栏一致（底部一条细条），命令直接输入，不加斜杠、不加前缀；执行结果只在输入行上方显示一行提示，不堆叠记录：
+
+| 命令 | 作用 |
+|---|---|
+| `play` / `resume` | 开始 / 继续播放 |
+| `pause` | 暂停 |
+| `p` / `toggle` | 播放 ↔ 暂停 |
+| `seek +30`、`seek -1:30` | 相对当前位置跳转（正数前进、负数后退，单位秒或 `mm:ss`） |
+| `seek 1:30`、`seek 1:02:03`、`seek 90` | 跳到绝对位置（`mm:ss` / `h:mm:ss` / 裸秒） |
+| `seek 40%` | 跳到视频时长的 40% |
+| `vol 50` / `volume 50` | 把音量设为 50（UI 刻度 0–200） |
+| `vol +5` / `vol -5` | 音量增减 5，自动夹在 0–200 |
+| `mute` | 静音切换 |
+| `mute on` / `mute off`（也接受 `1` / `0`） | 强制静音 / 取消静音 |
+| `exit` / `close` | 关闭 Borderless 回到世界视角 |
+| `help` / `?` | 列出全部命令 |
+| `Dev` | 关闭控制台功能（下次聊天键回到原版聊天） |
+
+Esc 关闭输入行，回到按键控制状态：
+
+| 键 | 作用 |
+|---|---|
+| F | 关闭 Borderless |
+| 空格 | 播放 / 暂停 |
+| ← / → | 后退 / 前进 5 秒（按住 Shift 为 15 秒） |
+| ↑ / ↓ | 音量 +5 / −5（按住 Shift 为 10） |
+| M | 静音 |
+| 聊天键 | 重新打开控制台 |
+
+控制台默认关闭：在 Borderless 播放中用聊天栏输入 `Dev` 并回车，为本次会话开启（该消息不会发到服务器）。希望进入 Borderless 就带控制台，可在配置页打开 **Borderless console**，或在 `config/dreamdisplayx/config.toml` 里设 `borderless-console = true`。
 
 ## 命令参考
 
@@ -99,7 +145,7 @@ V3、`/display group`、Paper 远程控制棒以及 Flashback / ReplayMod 桥接
 
 > **Bilibili 登录提示：** 在游戏中执行 `/dlogin`，使用 Bilibili 手机客户端扫描二维码。成功后，mod 会把 `SESSDATA` 发送到服务器并加密保存，再同步到服务器网络和在线客户端。
 
-搜索框和 `/display video` 都支持直接粘贴完整的 `http(s)` 视频文件地址；链接中的百分号编码路径会原样保留，适合 WebDAV 等直链文件。解析到多音轨或字幕轨时，可在显示器菜单的音频 / CC 按钮中切换；第二个 CC 按钮会把另一条字幕显示在双语文本的下一行。HLS 主播放列表只在实际选择子流时校验子链接，避免无效或过大的清单拖慢解析；字幕请求会限制大小和超时，直播字幕播放列表暂不下载。
+搜索框和 `/display video` 都支持直接粘贴完整的 `http(s)` 视频文件地址；链接中的百分号编码路径会原样保留，适合 WebDAV 等直链文件。链接带起播时间（B站 `?t=299.2`、YouTube `?t=1m30s`、通用 `?start=90`）时会从该时间开始播放。解析到多音轨或字幕轨时，可在显示器菜单的音频 / CC 按钮中切换；第二个 CC 按钮会把另一条字幕显示在双语文本的下一行。HLS 主播放列表只在实际选择子流时校验子链接，避免无效或过大的清单拖慢解析；字幕请求会限制大小和超时，直播字幕播放列表暂不下载。
 
 ## 下载
 
@@ -147,6 +193,7 @@ V3、`/display group`、Paper 远程控制棒以及 Flashback / ReplayMod 桥接
 | `-Ddreamdisplayx.networkCachingMs=<ms>` | `300` | libvlc 网络 / 文件缓存；网络卡顿时可以增大 |
 | `-Ddreamdisplayx.debugFps=true` | 关闭 | 在显示器菜单预览中显示实际视频 FPS |
 | `-Ddreamdisplayx.verboseLibvlc=true` | 关闭 | 打开 libvlc 调试日志 |
+| `-Ddreamdisplayx.avServo=false` | 开启 | 关闭采样级音画纠正（丢/补 PCM）；默认开启，极端情况下可能干预播放 |
 | `-Ddreamdisplayx.noDropLateFrames=true` | 关闭 | 禁止丢弃迟到帧（仅诊断，可能造成画面闪烁） |
 | `-Ddreamdisplayx.noAutoResync=true` | 关闭 | 禁用音视频漂移修正 |
 | `-Ddreamdisplayx.silentAudio=true` | 关闭 | 不创建音频输出，用于定位问题 |

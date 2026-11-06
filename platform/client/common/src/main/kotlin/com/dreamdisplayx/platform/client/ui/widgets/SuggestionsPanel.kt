@@ -5,6 +5,7 @@ import com.dreamdisplayx.platform.client.utils.translatableText
 import com.dreamdisplayx.api.media.search.model.MediaSearchResult
 import com.dreamdisplayx.platform.client.input.MouseButtons
 import com.dreamdisplayx.platform.client.render.FirstFrameThumbnails
+import com.dreamdisplayx.platform.client.mixins.EditBoxCaretHold
 import com.dreamdisplayx.platform.client.render.Thumbnails
 import com.dreamdisplayx.platform.client.ui.GuiGraphicsCompat
 import com.dreamdisplayx.platform.client.ui.editBoxHasFocus
@@ -46,6 +47,7 @@ import kotlin.math.roundToInt
 class SuggestionsPanel(
     private val onPick: (MediaSearchResult) -> Unit,
     private val controller: SuggestionsController,
+    private val onOpenUploader: (MediaSearchResult) -> Unit,
 ) : UiWidget(translatableText("dreamdisplayx.button.suggestions")) {
 
     init {
@@ -60,6 +62,7 @@ class SuggestionsPanel(
         onSelect = { controller.setBilibiliFilter(it) },
     )
     private val searchButton: IconButton
+    private var scopeRect = UiRect(0, 0, 0, 0)
 
     /** When this returns false the panel is locked: it shows an "unavailable" notice and ignores input. */
     var available: () -> Boolean = { true }
@@ -98,15 +101,25 @@ class SuggestionsPanel(
         // The controller owns the text: Minecraft rebuilds this panel (and so this EditBox) whenever
         // DisplayMenu.init runs, e.g. on a window resize, and the user's typed/pasted link must survive.
         searchBox.setValue(controller.searchText)
-        searchBox.setResponder { controller.searchText = it }
+        searchBox.setResponder { controller.onSearchTextChanged(it) }
+        controller.onRewriteSearchText = { cleaned ->
+            if (searchBox.value != cleaned) {
+                // setValue keeps the caret at the end (normal paste behaviour); then rewind only the
+                // visible window so a long link shows its host instead of its tail.
+                searchBox.setValue(cleaned)
+                (searchBox as? EditBoxCaretHold)?.dreamdisplayxSetDisplayPos(0)
+            }
+        }
         clearButton = IconButton(icon = { IconButton.modIcon("cross") }, margin = 4) {
-            searchBox.value = ""
+            controller.clearSearch()
+            searchBox.setValue("")
             editBoxSetFocused(searchBox, true)
         }
         sortButton = IconButton(icon = { IconButton.modIcon("filter") }, margin = 4) {
             sortDropdown.toggle()
         }
         searchButton = IconButton(icon = { IconButton.modIcon("search") }, margin = 4) {
+            searchBox.isFocused = true
             controller.runSearch(searchBox.value)
         }
     }
@@ -132,12 +145,46 @@ class SuggestionsPanel(
 
     /** Positions the search box and its action buttons for the current panel rect. */
     private fun layoutChildren() {
-        searchBox.x = x + 10
-        searchBox.y = searchRowY()
-        searchBox.width = width - 20 - (ACTION_W + ACTION_GAP) * 3
-        clearButton.place(UiRect(x + width - 10 - ACTION_W * 3 - ACTION_GAP * 2, searchRowY(), ACTION_W, SEARCH_H))
-        sortButton.place(UiRect(x + width - 10 - ACTION_W * 2 - ACTION_GAP, searchRowY(), ACTION_W, SEARCH_H))
-        searchButton.place(UiRect(x + width - 10 - ACTION_W, searchRowY(), ACTION_W, SEARCH_H))
+        val rowY = searchRowY()
+        var searchLeft = x + 10
+        scopeRect = UiRect(searchLeft, rowY, SCOPE_W, SEARCH_H)
+        searchLeft += SCOPE_W + ACTION_GAP
+        val actions = 3
+        val reserved = ACTION_W * actions + ACTION_GAP * (actions - 1)
+        searchBox.x = searchLeft
+        searchBox.y = rowY
+        val newWidth = max(40, x + width - 10 - reserved - searchLeft)
+        if (searchBox.width != newWidth) {
+            searchBox.width = newWidth
+            // setValue ran at width 100; scrollTo only guarantees caret visibility, not a start reset.
+            val caret = searchBox.cursorPosition
+            searchBox.setCursorPosition(0)
+            searchBox.setCursorPosition(caret)
+        }
+        val clearX = x + width - 10 - reserved
+        clearButton.place(UiRect(clearX, rowY, ACTION_W, SEARCH_H))
+        sortButton.place(UiRect(clearX + ACTION_W + ACTION_GAP, rowY, ACTION_W, SEARCH_H))
+        searchButton.place(UiRect(x + width - 10 - ACTION_W, rowY, ACTION_W, SEARCH_H))
+    }
+
+    /** Draws the compact scope toggle used at the left of the search row. */
+    private fun drawScopeButton(g: GuiGraphicsCompat, f: Font) {
+        if (scopeRect.w <= 0) return
+        val uploader = controller.searchScope == SearchScope.UPLOADER
+        g.fill(scopeRect.x, scopeRect.y, scopeRect.right, scopeRect.bottom, UiTheme.CARD_BG)
+        g.drawOutline(scopeRect, if (uploader) UiTheme.CARD_BORDER_HOVER else UiTheme.PANEL_BORDER)
+        val label = Component.translatableWithFallback(
+            if (uploader) "dreamdisplayx.suggestions.scope.uploader" else "dreamdisplayx.suggestions.scope.video",
+            if (uploader) "UP" else "Video",
+        ).string
+        g.drawText(
+            f,
+            label,
+            scopeRect.x + (scopeRect.w - f.width(label)) / 2,
+            scopeRect.y + (scopeRect.h - f.lineHeight) / 2,
+            if (uploader) UiTheme.TEXT_PRIMARY else UiTheme.TEXT_DIM,
+            false,
+        )
     }
 
     /** Card width for the current orientation/viewport. */
@@ -149,38 +196,28 @@ class SuggestionsPanel(
         if (vertical) max(THUMB_H, (cardW(viewportW) * 180.0 / 320.0).toInt()) else dynThumbH()
 
     /**
-     * Card height for [info] at the current orientation / viewport.
+     * Card height for the current orientation / viewport. Text is always one title line plus one
+     * meta line, so every card is the same height and the thumbnail keeps the remaining space.
      */
-    private fun cardH(viewportW: Int, info: MediaSearchResult): Int = when {
+    private fun cardH(viewportW: Int): Int = when {
         !vertical -> dynCardH()
         compactCards -> THUMB_H + 4
-        else -> thumbH(viewportW) + textBlockH(titleLineCount(Minecraft.getInstance().font, info, cardW(viewportW)))
+        else -> thumbH(viewportW) + textBlockH()
     }
 
-    /**
-     * Worst-case card height (a two-line title) for the current orientation / viewport, for call sites
-     * with no particular card in hand yet — the loading-more placeholder, or a row-centering calc that
-     * only applies to the (always uniform) horizontal strip anyway.
-     */
+    /** Worst-case card height for call sites without a particular card in hand. */
     private fun maxCardH(viewportW: Int): Int = when {
         !vertical -> dynCardH()
         compactCards -> THUMB_H + 4
-        else -> thumbH(viewportW) + textBlockH(2)
+        else -> thumbH(viewportW) + textBlockH()
     }
 
-    /** Number of lines [info]'s title wraps to at the current card width (1 or 2). */
-    private fun titleLineCount(f: Font, info: MediaSearchResult, cw: Int): Int =
-        UiText.wrap(f, info.title, cw - 8, 2).size.coerceAtLeast(1)
-
     /**
-     * Exact height [drawCard]'s title + meta block needs for a title wrapped to [lines] lines, plus a
-     * small fixed [BOTTOM_PAD] below the meta row.
+     * Height [drawCard]'s one title line + one meta line needs, plus [BOTTOM_PAD] below it.
      */
-    private fun textBlockH(lines: Int): Int {
+    private fun textBlockH(): Int {
         val lh = Minecraft.getInstance().font.lineHeight
-        // top gap (drawCard's `+ 4`) + that many title lines (each `lineHeight + 1`) + gap before the
-        // meta row (`+ 1`) + the meta row itself (one line) + breathing room below it.
-        return 4 + lines * (lh + 1) + 1 + lh + BOTTOM_PAD
+        return 4 + (lh + 1) + 1 + lh + BOTTOM_PAD
     }
 
     private fun dynThumbH(): Int {
@@ -196,15 +233,12 @@ class SuggestionsPanel(
         return max(80, (th * CARD_W / THUMB_H.toDouble()).toInt())
     }
 
-    /**
-     * Total scrollable content extent along the scroll axis. Vertical cards no longer share one height,
-     * so this sums each card's own (unlike the horizontal strip, which stays a flat width × count).
-     */
+    /** Total scrollable content extent along the scroll axis; every card shares one height. */
     private fun contentExtent(viewportW: Int): Int {
         val cards = controller.visibleCards
         if (cards.isEmpty()) return 0
         if (!vertical) return cards.size * (cardW(viewportW) + CARD_GAP) - CARD_GAP
-        return cards.sumOf { cardH(viewportW, it) + CARD_GAP } - CARD_GAP
+        return cards.size * (cardH(viewportW) + CARD_GAP) - CARD_GAP
     }
 
     /** Maximum scroll offset for the current viewport. */
@@ -217,6 +251,11 @@ class SuggestionsPanel(
 
         val f = Minecraft.getInstance().font
         g.drawText(f, message, x + 10, y + 10, UiTheme.TEXT_PRIMARY, false)
+        val resultCount = controller.visibleCards.size
+        if (resultCount > 0) {
+            val countText = Component.translatable("dreamdisplayx.suggestions.results", resultCount).string
+            g.drawText(f, countText, x + width - 10 - f.width(countText), y + 10, UiTheme.TEXT_DIM, false)
+        }
 
         if (!available()) {
             val notice = translatableText("dreamdisplayx.suggestions.unavailable").string
@@ -225,6 +264,7 @@ class SuggestionsPanel(
         }
 
         layoutChildren()
+        drawScopeButton(g, f)
         searchBox.renderChild(g, mouseX, mouseY, partialTick)
         clearButton.renderChild(g, mouseX, mouseY, partialTick)
         sortButton.renderChild(g, mouseX, mouseY, partialTick)
@@ -261,13 +301,16 @@ class SuggestionsPanel(
         scrollOffset = scrollOffset.coerceIn(0, maxOff)
 
         val cards = controller.visibleCards
-        g.enableScissor(stripLeft, stripTop, stripRight, stripBottom)
+        //? if <1.21.11 {
+        g.enableScissorPoseAware(stripLeft, stripTop, stripRight, stripBottom)
+        //?} else
+        /*g.enableScissor(stripLeft, stripTop, stripRight, stripBottom)*/
         hoveredCard = -1
         val rowY = if (vertical) 0 else stripTop + max(0, (viewportH - refCh) / 2)
         var pos = (if (vertical) stripTop else stripLeft) - scrollOffset
         for (i in cards.indices) {
             val info = cards[i]
-            val ch = cardH(viewportW, info)
+            val ch = cardH(viewportW)
             val cardX = if (vertical) stripLeft else pos
             val cardY = if (vertical) pos else rowY
             val visibleOnAxis = if (vertical) {
@@ -319,6 +362,7 @@ class SuggestionsPanel(
 
     /** Draws the sort dropdown last so it layers on top of the card strip below the search row. */
     private fun drawSortDropdown(g: GuiGraphicsCompat, mouseX: Int, mouseY: Int) {
+        if (!sortButton.visible) return
         sortDropdown.draw(g, sortButton.x + sortButton.width / 2, sortButton.y + sortButton.height, mouseX, mouseY)
     }
 
@@ -425,11 +469,15 @@ class SuggestionsPanel(
         }
     }
 
-    /** Draws one result card: hover-pulsing background, thumbnail, NEW/duration tags, title, and meta. */
+    /** Draws one result card: hover-pulsing background, thumbnail, platform/duration tags, title, and meta. */
     private fun drawCard(
         g: GuiGraphicsCompat, f: Font, info: MediaSearchResult,
         x: Int, y: Int, w: Int, thumbH: Int, cardH: Int, hover: Boolean,
     ) {
+        if (info.isUploader) {
+            drawUploaderCard(g, f, info, x, y, w, cardH, hover)
+            return
+        }
         // On hover, tint the card to the video's own dominant color (ambient), falling back to the
         // neutral grey highlight until the thumbnail (and thus its average color) has decoded.
         val ambient = if (hover) Thumbnails.averageColor(info.id) else null
@@ -463,11 +511,10 @@ class SuggestionsPanel(
             )
         }
 
-        // A platform tag (Twitch / Vimeo / Kick / Link) takes precedence over the generic "New"
-        // badge, since knowing where a result comes from matters more than its age
+        // Keep the thumbnail readable: only a platform tag is shown, not a generic recency badge.
         val badge = PlatformBadge.forResult(info)
-        when {
-            badge != null -> drawCardTag(
+        if (badge != null) {
+            drawCardTag(
                 g,
                 f,
                 translatableText(badge.labelKey).string,
@@ -476,15 +523,18 @@ class SuggestionsPanel(
                 thumbX,
                 thumbY
             )
-
-            info.isRecent(7) -> drawCardTag(
+        }
+        val unionBadge = PlatformBadge.unionBadge(info)
+        if (unionBadge != null) {
+            drawRightCardTag(
                 g,
                 f,
-                translatableText("dreamdisplayx.ui.new").string,
-                UiTheme.ACCENT_NEW_TAG,
-                UiTheme.TEXT_PRIMARY,
+                translatableText(unionBadge.labelKey).string,
+                unionBadge.bgColor,
+                unionBadge.textColor,
                 thumbX,
-                thumbY
+                thumbY,
+                thumbW,
             )
         }
 
@@ -502,6 +552,19 @@ class SuggestionsPanel(
             g.drawText(f, dur, dx, dy, UiTheme.TEXT_PRIMARY, true)
         }
 
+        // Compact cards have no text block below the thumbnail; keep the title visible on the
+        // cover itself so a failed/absent thumbnail never leaves an unidentified black card.
+        if (compactCards || cardH <= thumbH + 6) {
+            val scrimH = 18
+            g.fillVGradient(
+                thumbX, thumbY + thumbH - scrimH, thumbX + thumbW, thumbY + thumbH,
+                0x00000000, 0xCC000000.toInt(),
+            )
+            val titleW = thumbW - 8 - (if (dur.isNotEmpty()) f.width(dur) + 6 else 0)
+            val title = UiText.trim(f, info.title, titleW.coerceAtLeast(24))
+            g.drawText(f, title, thumbX + 4, thumbY + thumbH - f.lineHeight - 3, UiTheme.TEXT_PRIMARY, true)
+        }
+
         // Draw the hover frame over the full card (including the full-bleed thumbnail's edges) so the
         // selection reads as one crisp outline instead of an animated flicker.
         if (hover) g.drawOutline(UiRect(x, y, w, cardH), hoverBorder)
@@ -511,17 +574,31 @@ class SuggestionsPanel(
         val textX = x + 4
         val textW = w - 8
         var textY = thumbY + thumbH + 4
-        for (line in UiText.wrap(f, info.title, textW, 2)) {
-            g.drawText(f, line, textX, textY, UiTheme.TEXT_PRIMARY, true)
-            textY += f.lineHeight + 1
-        }
-
+        g.drawText(f, UiText.trim(f, info.title, textW), textX, textY, UiTheme.TEXT_PRIMARY, true)
+        textY += f.lineHeight + 1
         textY += 1
-        var meta = info.uploader ?: ""
-        val views = info.formatViews()
-        if (views.isNotEmpty()) {
-            meta = if (meta.isEmpty()) views
-            else UiText.trim(f, meta, max(20, textW - f.width(" • $views"))) + " • " + views
+        val meta = if (info.isUploader) {
+            buildList {
+                info.uploaderFans?.let {
+                    add(Component.translatableWithFallback(
+                        "dreamdisplayx.suggestions.fans", "%s fans", compactCount(it),
+                    ).string)
+                }
+                info.uploaderVideoCount?.let {
+                    add(Component.translatableWithFallback(
+                        "dreamdisplayx.suggestions.videos", "%s videos", compactCount(it),
+                    ).string)
+                }
+                if (isEmpty()) info.uploader?.let(::add)
+            }.joinToString(" · ")
+        } else {
+            var value = info.uploader ?: ""
+            val views = info.formatViews()
+            if (views.isNotEmpty()) {
+                value = if (value.isEmpty()) views
+                else UiText.trim(f, value, max(20, textW - f.width(" • $views"))) + " • " + views
+            }
+            value
         }
         if (meta.isNotEmpty()) {
             var metaX = textX
@@ -543,6 +620,59 @@ class SuggestionsPanel(
         }
     }
 
+    /** Uploader results use a square avatar and bottom-anchored name/meta instead of a 16:9 video card. */
+    private fun drawUploaderCard(
+        g: GuiGraphicsCompat,
+        f: Font,
+        info: MediaSearchResult,
+        x: Int,
+        y: Int,
+        w: Int,
+        cardH: Int,
+        hover: Boolean,
+    ) {
+        g.fill(x, y, x + w, y + cardH, if (hover) UiTheme.CARD_BG_HOVER else UiTheme.CARD_BG)
+        val textW = w - 8
+        val meta = buildList {
+            info.uploaderFans?.let {
+                add(Component.translatableWithFallback(
+                    "dreamdisplayx.suggestions.fans", "%s fans", compactCount(it),
+                ).string)
+            }
+            info.uploaderVideoCount?.let {
+                add(Component.translatableWithFallback(
+                    "dreamdisplayx.suggestions.videos", "%s videos", compactCount(it),
+                ).string)
+            }
+            if (isEmpty()) info.uploader?.let(::add)
+        }.joinToString(" · ")
+        val metaY = y + cardH - f.lineHeight - 4
+        val nameY = metaY - f.lineHeight - 2
+        val avatarSize = min(w - 16, (cardH - 2 * f.lineHeight - 14).coerceAtLeast(24))
+        val avatarX = x + (w - avatarSize) / 2
+        val avatarY = y + 2
+        val avatar = Thumbnails.get(info.id)
+        if (avatar != null) {
+            blitAvatar(g, avatar, info.id, avatarX, avatarY, avatarSize)
+        } else {
+            g.drawShimmer(
+                avatarX, avatarY, avatarX + avatarSize, avatarY + avatarSize,
+                UiTheme.PLACEHOLDER_BG, UiTheme.PLACEHOLDER_SHIMMER,
+            )
+            info.thumbnailUrlOverride?.let { Thumbnails.request(info.id, it) }
+        }
+        g.drawOutline(UiRect(avatarX - 1, avatarY - 1, avatarSize + 2, avatarSize + 2), UiTheme.PANEL_BORDER)
+        val shownName = UiText.trim(f, info.title, textW)
+        g.drawText(f, shownName, x + 4, nameY, UiTheme.TEXT_PRIMARY, true)
+        if (info.isVerified) {
+            g.drawVerifiedBadge(x + 4 + f.width(shownName) + 3, nameY, f.lineHeight - 1, UiTheme.ACCENT)
+        }
+        if (meta.isNotBlank()) {
+            g.drawText(f, UiText.trim(f, meta, textW), x + 4, metaY, UiTheme.TEXT_META, true)
+        }
+        if (hover) g.drawOutline(UiRect(x, y, w, cardH), UiTheme.CARD_BORDER_HOVER)
+    }
+
     /** Draws a small top-left tag ([label]) on a [bg] plate with [textColor] text. */
     private fun drawCardTag(
         g: GuiGraphicsCompat,
@@ -562,6 +692,24 @@ class SuggestionsPanel(
         g.drawText(f, label, thumbX + 5, thumbY + 4, textColor, false)
     }
 
+    /** Draws a small top-right tag so it never covers the platform/access tag at the top-left. */
+    private fun drawRightCardTag(
+        g: GuiGraphicsCompat,
+        f: Font,
+        label: String,
+        bg: Int,
+        textColor: Int,
+        thumbX: Int,
+        thumbY: Int,
+        thumbW: Int,
+    ) {
+        val tw = f.width(label) + 6
+        val tagH = f.lineHeight + 4
+        val tagX = thumbX + thumbW - tw - 2
+        g.fill(tagX, thumbY + 2, tagX + tw, thumbY + 2 + tagH, bg)
+        g.drawText(f, label, tagX + 3, thumbY + 4, textColor, false)
+    }
+
     /**
      * Stand-in card art for a card with no thumbnail to load - a custom link, or a platform result
      * whose metadata carried none: a soft vertical plate with the source's host / uploader centered
@@ -577,11 +725,32 @@ class SuggestionsPanel(
         g.drawText(f, label, x + (w - f.width(label)) / 2, y + (h - f.lineHeight) / 2, UiTheme.TEXT_SECONDARY, true)
     }
 
+    private fun compactCount(value: Long): String = when {
+        value >= 1_000_000_000L -> String.format("%.1fB", value / 1_000_000_000.0)
+        value >= 1_000_000L -> String.format("%.1fM", value / 1_000_000.0)
+        value >= 1_000L -> String.format("%.1fK", value / 1_000.0)
+        else -> value.toString()
+    }
+
     private fun blitTexture(g: GuiGraphicsCompat, id: Identifier, x: Int, y: Int, w: Int, h: Int) {
         //? if >=1.21.11 {
         g.blit(RenderPipelines.GUI_TEXTURED, id, x, y, 0f, 0f, w, h, w, h)
         //?} else
         /*g.blit(id, x, y, 0f, 0f, w, h, w, h)*/
+    }
+
+    /** Center-crops an uploader avatar so a non-square source never gets flattened into the card. */
+    private fun blitAvatar(g: GuiGraphicsCompat, id: Identifier, key: String, x: Int, y: Int, size: Int) {
+        val dims = Thumbnails.dimensions(key)
+        val sourceW = dims?.first?.takeIf { it > 0 } ?: size
+        val sourceH = dims?.second?.takeIf { it > 0 } ?: size
+        val side = min(sourceW, sourceH)
+        val u = (sourceW - side) / 2f
+        val v = (sourceH - side) / 2f
+        //? if >=1.21.11 {
+        g.blit(RenderPipelines.GUI_TEXTURED, id, x, y, u, v, size, size, side, side, sourceW, sourceH)
+        //?} else
+        /*g.blit(id, x, y, size, size, u, v, side, side, sourceW, sourceH)*/
     }
 
     //? if >=1.20.2 {
@@ -624,6 +793,12 @@ class SuggestionsPanel(
                 my
             )
         ) return true
+        if (scopeRect.contains(mx, my)) {
+            controller.setSearchScope(
+                if (controller.searchScope == SearchScope.UPLOADER) SearchScope.VIDEO else SearchScope.UPLOADER,
+            )
+            return true
+        }
         if (clearButton.isMouseOver(mouseX, mouseY)) return clearButton.mouseClicked(event, dbl)
         if (onSortButton) return sortButton.mouseClicked(event, dbl)
         if (searchButton.isMouseOver(mouseX, mouseY)) return searchButton.mouseClicked(event, dbl)
@@ -644,7 +819,8 @@ class SuggestionsPanel(
         if (card in controller.visibleCards.indices) {
             val s = SimpleSoundInstance.forUI(buttonClickSound(), 1.0f)
             Minecraft.getInstance().soundManager.play(s)
-            onPick(controller.visibleCards[card])
+            val result = controller.visibleCards[card]
+            if (result.isUploader) onOpenUploader(result) else onPick(result)
             return true
         }
         return false
@@ -672,6 +848,12 @@ class SuggestionsPanel(
         val my = mouseY.toInt()
         val onSortButton = sortButton.isMouseOver(mouseX, mouseY)
         if (sortDropdown.visible && MouseButtons.isLeft(button) && !onSortButton && sortDropdown.handleClick(mx, my)) return true
+        if (scopeRect.contains(mx, my)) {
+            controller.setSearchScope(
+                if (controller.searchScope == SearchScope.UPLOADER) SearchScope.VIDEO else SearchScope.UPLOADER,
+            )
+            return true
+        }
         if (clearButton.isMouseOver(mouseX, mouseY)) return clearButton.mouseClicked(mouseX, mouseY, button)
         if (onSortButton) return sortButton.mouseClicked(mouseX, mouseY, button)
         if (searchButton.isMouseOver(mouseX, mouseY)) return searchButton.mouseClicked(mouseX, mouseY, button)
@@ -692,7 +874,8 @@ class SuggestionsPanel(
         if (card in controller.visibleCards.indices) {
             val s = SimpleSoundInstance.forUI(buttonClickSound(), 1.0f)
             Minecraft.getInstance().soundManager.play(s)
-            onPick(controller.visibleCards[card])
+            val result = controller.visibleCards[card]
+            if (result.isUploader) onOpenUploader(result) else onPick(result)
             return true
         }
         return false
@@ -744,7 +927,7 @@ class SuggestionsPanel(
         val rowY = if (vertical) 0 else stripTop + max(0, (viewportH - maxCardH(viewportW)) / 2)
         var pos = (if (vertical) stripTop else stripLeft) - scrollOffset
         for ((i, info) in controller.visibleCards.withIndex()) {
-            val ch = cardH(viewportW, info)
+            val ch = cardH(viewportW)
             val cardX = if (vertical) stripLeft else pos
             val cardY = if (vertical) pos else rowY
             if (mouseX >= max(cardX, stripLeft) && mouseX < min(cardX + cw, stripRight) &&
@@ -807,13 +990,14 @@ class SuggestionsPanel(
         private const val SB_GRAB = 4
         private const val CARD_GAP = 6
         private const val CARD_W = 152
-        private const val CARD_TEXT_H = 32
+        private const val CARD_TEXT_H = 24
         private const val THUMB_H = 86
         private const val BOTTOM_PAD = 4
         private const val CARD_H = THUMB_H + CARD_TEXT_H
         private const val SEARCH_H = 22
         private const val ACTION_W = SEARCH_H
         private const val ACTION_GAP = 4
+        private const val SCOPE_W = 34
 
         /** Internal vertical paddings a card adds around its thumbnail + text (see [dynThumbH]/[dynCardH]). */
         private const val CARD_INNER_PAD = 2 + 3 + 2

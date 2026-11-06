@@ -53,6 +53,9 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
     private val emittedKeys = HashSet<String>()
     private val loadedSegments = HashSet<Int>()
     private val loadingSegments = HashSet<Int>()
+    private val mergedContentIndex = HashMap<String, Int>()
+    private var blockRulesRaw = ""
+    private var cachedBlockRules: List<DanmakuBlockRule> = emptyList()
 
     private var danmakuVideo: BiliDanmakuVideo? = null
     private var sourceTask: CompletableFuture<BiliDanmakuVideo?>? = null
@@ -71,7 +74,7 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
 
     private fun enabled(): Boolean = config.danmakuEnabled && screen.danmakuEnabled
     private fun speedMultiplier(): Float = SPEED_MULTIPLIERS[config.danmakuSpeedPreset.coerceIn(0, SPEED_MULTIPLIERS.size - 1)]
-    private fun scaleMultiplier(): Float = config.danmakuScalePercent.coerceIn(50, 170) / 100.0f
+    private fun scaleMultiplier(): Float = config.danmakuScalePercent.coerceIn(25, 170) / 100.0f
     private fun densityPreset(): Int =
         if (config.danmakuRollingRangePercent != 100) DENSITY_NORMAL else config.danmakuDensityPreset.coerceIn(DENSITY_NORMAL, DENSITY_OVERLAP)
 
@@ -118,7 +121,7 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
         val result = ArrayList<RenderableDanmaku>(active.size)
         val op = config.danmakuOpacity.coerceIn(20, 100) / 100.0f
         for (item in active) {
-            if (blockedBySettings(item.mode, item.color)) continue
+            if (blockedBySettings(item.mode, item.color, item.colorful)) continue
             val duration = durationMs(item, canvasWidth)
             val elapsed = animationTime - item.startTime
             if (elapsed < 0 || elapsed > duration) continue
@@ -141,7 +144,12 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
                 y = 6f + item.lane * LANE_HEIGHT
             }
             if (x + width < -0.5f || x > canvasWidth + 0.5f || y + height < 0 || y > canvasHeight) continue
-            result.add(RenderableDanmaku(item.text, x, y, scale, item.color, width, height, !item.rolling, op))
+            result.add(
+                RenderableDanmaku(
+                    item.text, x, y, scale, item.color, width, height, !item.rolling, op,
+                    item.count, item.colorful,
+                ),
+            )
         }
         return result
     }
@@ -153,6 +161,7 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
         active.clear()
         vodEntries.clear()
         vodEntryKeys.clear()
+        mergedContentIndex.clear()
         emittedKeys.clear()
         loadedSegments.clear()
         loadingSegments.clear()
@@ -184,7 +193,9 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
 
     private fun updateActive() {
         val cw = canvasWidth()
-        active.removeAll { blockedBySettings(it.mode, it.color) || animationTime - it.startTime > durationMs(it, cw) }
+        active.removeAll {
+            blockedBySettings(it.mode, it.color, it.colorful) || animationTime - it.startTime > durationMs(it, cw)
+        }
     }
 
     private fun resetForInfo(videoKey: String) {
@@ -195,6 +206,7 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
         active.clear()
         vodEntries.clear()
         vodEntryKeys.clear()
+        mergedContentIndex.clear()
         emittedKeys.clear()
         loadedSegments.clear()
         loadingSegments.clear()
@@ -264,12 +276,44 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
     }
 
     private fun addVodEntries(entries: List<DanmakuEntry>) {
-        for (entry in entries) {
-            if (!entry.renderable()) continue
-            if (vodEntryKeys.add(entry.key())) vodEntries.add(entry)
+        if (config.danmakuMergeDuplicates) {
+            val grouped = LinkedHashMap<String, DanmakuEntry>()
+            for (entry in entries) {
+                if (!entry.renderable() || blockedBySettings(entry.mode, entry.color, entry.colorful) ||
+                    blockedByContent(entry.content)) continue
+                val previous = grouped[entry.content]
+                grouped[entry.content] = if (previous == null) {
+                    entry.copy(count = 1)
+                } else {
+                    previous.copy(count = previous.count + entry.count)
+                }
+            }
+            for (entry in grouped.values) addMergedVodEntry(entry)
+        } else {
+            for (entry in entries) {
+                if (!entry.renderable() || blockedBySettings(entry.mode, entry.color, entry.colorful) ||
+                    blockedByContent(entry.content)) continue
+                if (vodEntryKeys.add(entry.key())) vodEntries.add(entry)
+            }
         }
         vodEntries.sortBy { it.progressMs }
+        if (config.danmakuMergeDuplicates) {
+            mergedContentIndex.clear()
+            vodEntries.forEachIndexed { index, entry -> mergedContentIndex[entry.content] = index }
+        }
         if (lastProgress >= 0) nextVodIndex = minOf(nextVodIndex, lowerBound(max(0L, lastProgress - 1000)))
+    }
+
+    private fun addMergedVodEntry(entry: DanmakuEntry) {
+        val existingIndex = mergedContentIndex[entry.content]
+        if (existingIndex != null && existingIndex in vodEntries.indices) {
+            val existing = vodEntries[existingIndex]
+            vodEntries[existingIndex] = existing.copy(count = existing.count + entry.count)
+            return
+        }
+        if (!vodEntryKeys.add(entry.key())) return
+        mergedContentIndex[entry.content] = vodEntries.size
+        vodEntries.add(entry)
     }
 
     private fun enqueueVodDue(progress: Long) {
@@ -292,7 +336,7 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
 
     private fun enqueue(entry: DanmakuEntry?) {
         if (entry == null || !entry.renderable()) return
-        if (blockedBySettings(entry.mode, entry.color)) return
+        if (blockedBySettings(entry.mode, entry.color, entry.colorful) || blockedByContent(entry.content)) return
         spawn(entry)
     }
 
@@ -302,7 +346,8 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
         // immediately instead of only affecting comments spawned after the change.
         val baseScale = entry.scale()
         val text = entry.content
-        val metrics = DanmakuTextLayoutCache.measure(text, baseScale * scaleMultiplier())
+        val colorful = entry.colorful && config.danmakuShowColorful
+        val metrics = DanmakuTextLayoutCache.measure(text, baseScale * scaleMultiplier(), entry.count)
         val width = metrics.width
         val height = metrics.height
         val lane: Int
@@ -319,7 +364,12 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
             if (lane < 0) return false
         }
         if (active.size >= MAX_ACTIVE) active.removeAt(0)
-        active.add(ActiveDanmaku(text, entry.mode, entry.argb(), baseScale, lane, animationTime))
+        active.add(
+            ActiveDanmaku(
+                text, entry.mode, entry.argb(), baseScale, lane, animationTime,
+                entry.count, colorful,
+            ),
+        )
         return true
     }
 
@@ -340,10 +390,12 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
     private fun ActiveDanmaku.effectiveScale(): Float = baseScale * scaleMultiplier()
 
     /** Width for the current effective scale; served from the text layout cache. */
-    private fun ActiveDanmaku.effectiveWidth(): Float = DanmakuTextLayoutCache.measure(text, effectiveScale()).width
+    private fun ActiveDanmaku.effectiveWidth(): Float =
+        DanmakuTextLayoutCache.measure(text, effectiveScale(), count).width
 
     /** Height for the current effective scale; served from the text layout cache. */
-    private fun ActiveDanmaku.effectiveHeight(): Float = DanmakuTextLayoutCache.measure(text, effectiveScale()).height
+    private fun ActiveDanmaku.effectiveHeight(): Float =
+        DanmakuTextLayoutCache.measure(text, effectiveScale(), count).height
 
     // ── lanes ──
 
@@ -416,13 +468,30 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
 
     // ── settings ──
 
-    private fun blockedBySettings(mode: Int, color: Int): Boolean {
+    private fun blockedBySettings(mode: Int, color: Int, colorful: Boolean): Boolean {
         val rolling = mode == 1 || mode == 2 || mode == 3 || mode == 6
         val fixed = mode == 4 || mode == 5
         if (config.danmakuBlockRolling && rolling) return true
         if (config.danmakuBlockFixed && fixed) return true
         if (config.danmakuBottomGuard && mode == 4) return true
-        return config.danmakuBlockColored && (color and 0x00FFFFFF) != 0x00FFFFFF
+        return config.danmakuBlockColored &&
+            (colorful || (color and 0x00FFFFFF) != 0x00FFFFFF)
+    }
+
+    private fun blockedByContent(text: String): Boolean {
+        val rules = blockRules()
+        if (rules.isEmpty()) return false
+        return rules.any { rule ->
+            rule.regex?.containsMatchIn(text) ?: text.contains(rule.literal.orEmpty(), ignoreCase = true)
+        }
+    }
+
+    private fun blockRules(): List<DanmakuBlockRule> {
+        val raw = config.danmakuBlockWords
+        if (raw == blockRulesRaw) return cachedBlockRules
+        blockRulesRaw = raw
+        cachedBlockRules = DanmakuBlockWords.parse(raw)
+        return cachedBlockRules
     }
 
     // ── models ──
@@ -437,6 +506,8 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
         val height: Float,
         val fixed: Boolean,
         val opacity: Float,
+        val count: Int,
+        val colorful: Boolean,
     )
 
     private data class ActiveDanmaku(
@@ -446,6 +517,8 @@ class ClientDanmakuController(private val screen: DisplayScreen) {
         val baseScale: Float,
         val lane: Int,
         val startTime: Long,
+        val count: Int,
+        val colorful: Boolean,
     ) {
         val rolling: Boolean get() = mode == 1 || mode == 2 || mode == 3 || mode == 6
         val leftToRight: Boolean get() = mode == 6

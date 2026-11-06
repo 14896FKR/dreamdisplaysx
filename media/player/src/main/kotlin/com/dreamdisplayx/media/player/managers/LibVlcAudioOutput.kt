@@ -40,6 +40,9 @@ internal class LibVlcAudioOutput(
         /** Nanoseconds per decoded frame; the blip of one stereo S16 sample pair. */
         private const val FRAME_NANOS = 1_000_000_000L / SAMPLE_RATE
 
+        /** Cap on samples skipped for one catch-up request (~2 s); a larger ask means the caller is wrong. */
+        private const val MAX_CATCH_UP_FRAMES = SAMPLE_RATE.toLong() * 2L
+
         /** Upper bound on frames per audio callback (~0.25 s). A post-seek/pause pathological count that is
          * actually backed by a smaller native sample region must not make us read further than libvlc intends —
          * over-reading native memory was the stack-buffer-overrun crash (0xC0000409) on seek/pause. */
@@ -123,6 +126,10 @@ internal class LibVlcAudioOutput(
     @Volatile
     private var loggedFirstBlock = false
 
+    /** Set once the first line flush after a pause/seek boundary is logged (one-shot INFO diagnostic). */
+    @Volatile
+    private var loggedFlush = false
+
     // ── A/V sync clock ───────────────────────────────────────────────────────
     //
     // After the audio split, libvlc's own clock advances as samples are *delivered* to our play
@@ -142,6 +149,29 @@ internal class LibVlcAudioOutput(
     @Volatile
     private var clockLive = false
 
+    /** Frames ever handed to the line; monotonic across flushes so two samples can be diffed. */
+    @Volatile
+    private var fedFramesTotal = 0L
+
+    /** Frames the device had played when the lead cache was last refreshed (audio thread only). */
+    @Volatile
+    private var emittedFramesTotal = 0L
+
+    /** Frames still to be skipped to catch up with the video clock; 0 when in sync. */
+    private val catchUpFramesRemaining = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /**
+     * PCM actually dropped by catch-up since the last reset. libvlc's audio clock does not move when
+     * we drop samples, so the A/V servo must add this back or it re-corrects the same error forever.
+     */
+    private val catchUpAppliedFrames = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** Frames still to be repeated to fall back to the video clock; 0 when in sync. */
+    private val padFramesRemaining = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** Scratch buffer for padded blocks; audio thread only. */
+    private var padBuffer = ByteArray(0)
+
     // ── Control ──────────────────────────────────────────────────────────────
 
     /** Resets per-session state (called at the start of every playback). MUST NOT touch the line: this runs
@@ -153,10 +183,12 @@ internal class LibVlcAudioOutput(
         runCatching { dspStage?.reset() }
         clockLive = false
         paused = false
-        resyncPending = false
+        // Defer the flush to the audio callback; resetting counters here hid queued PCM from sync.
+        resyncPending = true
         cachedLeadNanos = null
-        totalWrittenFrames = 0L
         loggedFirstBlock = false
+        loggedFlush = false
+        catchUpAppliedFrames.set(0L)
     }
 
     /**
@@ -167,9 +199,12 @@ internal class LibVlcAudioOutput(
      */
     fun onSeekReset() {
         paused = false
-        resyncPending = false
+        resyncPending = true
         clockLive = false
         cachedLeadNanos = null
+        catchUpFramesRemaining.set(0L)
+        padFramesRemaining.set(0L)
+        catchUpAppliedFrames.set(0L)
     }
 
     /** Updates the gain applied to the PCM (user volume × distance attenuation). */
@@ -235,10 +270,13 @@ internal class LibVlcAudioOutput(
             logger.warn("$debugLabel audio block too large ({} frames) — dropping to avoid a native overrun.", count)
             return
         }
-        // While paused, do not touch the line at all (see [onPause]) — drop the samples entirely. They
-        // must not reach [totalWrittenFrames] either: the line never saw them, so the written-vs-emitted
-        // delta (the A/V lead) would balloon after seek→pause→resume. The line keeps running and drains
-        // to silence; resume flows again.
+        // Flush even while paused; otherwise the queued tail replays after resume.
+        if (resyncPending) {
+            resyncPending = false
+            flushLineLocked(ln, "pause/seek")
+        }
+        // While paused, drop samples entirely. They must not reach [totalWrittenFrames] either:
+        // the line never saw them, so the written-vs-emitted delta would balloon.
         if (paused) return
         val bytes = count * BYTES_PER_FRAME
         if (pcmBuffer.size < bytes) pcmBuffer = ByteArray(bytes)
@@ -250,24 +288,30 @@ internal class LibVlcAudioOutput(
             loggedFirstBlock = true
             logger.info("$debugLabel first audio block delivered to the line ({} frames).", count)
         }
-        // If the render thread asked for a re-sync, drain the residue BEFORE writing this block so the
-        // audible audio snaps back to the video clock. This must run on the audio thread (the line's
-        // owner) — never from the render thread, which would race the line and corrupt the heap.
-        if (resyncPending) {
-            resyncPending = false
-            synchronized(lineLock) {
-                runCatching { ln.flush() }
-                totalWrittenFrames = runCatching { ln.getLongFramePosition() ?: 0L }.getOrDefault(0L)
-            }
-            clockLive = false
-            logger.debug("$debugLabel audio flushed on audio thread to re-sync A/V.")
-        }
         // Only frames that actually reached the line count. The write watchdog can drop the tail of a
         // block when the device stalls, and counting the full block made the written-vs-emitted delta
         // (the A/V lead) read as huge, which tripped the auto-resync flush over and over — audible
         // stutter and desync.
-        val writtenFrames = feed(pcmBuffer, bytes, ln)
+        var source = pcmBuffer
+        var framesToFeed = count
+        val pad = padFramesRemaining.get()
+        if (pad > 0L) {
+            val grown = padFramesEvenly(pcmBuffer, count, pad.coerceAtMost((count / 8).toLong()).toInt())
+            padFramesRemaining.addAndGet(-(grown - count).toLong())
+            source = padBuffer
+            framesToFeed = grown
+        }
+        val pending = catchUpFramesRemaining.get()
+        if (pending > 0L) {
+            val kept = dropFramesEvenly(source, framesToFeed, pending.coerceAtMost(framesToFeed.toLong()).toInt())
+            val dropped = framesToFeed - kept
+            catchUpFramesRemaining.addAndGet(-dropped.toLong())
+            catchUpAppliedFrames.addAndGet(dropped.toLong())
+            framesToFeed = kept
+        }
+        val writtenFrames = feed(source, framesToFeed * BYTES_PER_FRAME, ln)
         totalWrittenFrames += writtenFrames
+        fedFramesTotal += writtenFrames
         clockLive = writtenFrames > 0
         // Refresh the A/V lead cache on the audio thread (the line's owner); the render thread reads
         // only this cached value so the native line is never touched cross-thread (heap-corruption risk).
@@ -290,6 +334,70 @@ internal class LibVlcAudioOutput(
      */
     fun bufferedNanos(): Long? = cachedLeadNanos?.coerceAtLeast(0L)
 
+    /** Nanos of PCM handed to the line since this output opened (monotonic, survives flushes). */
+    fun fedNanos(): Long = fedFramesTotal * FRAME_NANOS
+
+    /** Nanos the device had actually played at the last lead refresh; 0 until the first block. */
+    fun emittedNanos(): Long = emittedFramesTotal * FRAME_NANOS
+
+    /**
+     * Skips about [ms] of PCM over the following blocks to pull the audible position forward.
+     * Spread evenly, so a 200 ms correction costs ~2% of samples per block instead of an audible gap.
+     */
+    fun requestCatchUpMs(ms: Long) {
+        if (ms <= 0L) return
+        val frames = ms * SAMPLE_RATE / 1000L
+        catchUpFramesRemaining.updateAndGet { (it + frames).coerceAtMost(MAX_CATCH_UP_FRAMES) }
+    }
+
+    /** Repeats about [ms] of PCM over the following blocks to let the picture catch up. */
+    fun requestInsertMs(ms: Long) {
+        if (ms <= 0L) return
+        val frames = ms * SAMPLE_RATE / 1000L
+        padFramesRemaining.updateAndGet { (it + frames).coerceAtMost(MAX_CATCH_UP_FRAMES) }
+    }
+
+    /** Grows [count] frames of [buf] into [padBuffer], repeating [framesToAdd] frames evenly. */
+    private fun padFramesEvenly(buf: ByteArray, count: Int, framesToAdd: Int): Int {
+        val add = framesToAdd.coerceIn(0, count / 8)
+        if (add <= 0) return count
+        val total = count + add
+        if (padBuffer.size < total * BYTES_PER_FRAME) padBuffer = ByteArray(total * BYTES_PER_FRAME)
+        val step = count / add
+        var read = 0
+        for (i in 0 until total) {
+            val srcFrame = if (i > 0 && i % step == 0) (read - 1).coerceAtLeast(0) else read
+            val src = srcFrame * BYTES_PER_FRAME
+            val dst = i * BYTES_PER_FRAME
+            for (b in 0 until BYTES_PER_FRAME) padBuffer[dst + b] = buf[src + b]
+            if (i > 0 && i % step == 0) continue
+            read++
+        }
+        return total
+    }
+
+    /** Compacts [buf] in place, dropping [framesToDrop] of [count] frames evenly. Returns frames kept. */
+    private fun dropFramesEvenly(buf: ByteArray, count: Int, framesToDrop: Int): Int {
+        val drop = framesToDrop.coerceIn(0, count / 4)
+        if (drop <= 0) return count
+        val step = count / drop
+        var write = 0
+        var nextDrop = step
+        for (i in 0 until count) {
+            if (i == nextDrop) {
+                nextDrop += step
+                continue
+            }
+            if (write != i) {
+                val src = i * BYTES_PER_FRAME
+                val dst = write * BYTES_PER_FRAME
+                for (b in 0 until BYTES_PER_FRAME) buf[dst + b] = buf[src + b]
+            }
+            write++
+        }
+        return write
+    }
+
     /**
      * Cache the current lead from [totalWrittenFrames] against the line's emitted-frame counter. MUST be
      * called on the libvlc audio thread (from [onPlay] / [onFlush]); the render thread reads only the
@@ -298,7 +406,28 @@ internal class LibVlcAudioOutput(
     private fun updateLeadCache() {
         val ln = line ?: run { cachedLeadNanos = null; return }
         val emitted = ln.getLongFramePosition()
+        emittedFramesTotal = emitted
         cachedLeadNanos = (totalWrittenFrames - emitted) * FRAME_NANOS
+    }
+
+    /** Drops queued PCM on the audio thread and re-anchors the written-frame counter. */
+    private fun flushLineLocked(ln: SourceDataLine, reason: String) {
+        synchronized(lineLock) {
+            runCatching { ln.flush() }
+            totalWrittenFrames = runCatching { ln.getLongFramePosition() }.getOrDefault(0L)
+        }
+        clockLive = false
+        cachedLeadNanos = null
+        catchUpFramesRemaining.set(0L)
+        padFramesRemaining.set(0L)
+        catchUpAppliedFrames.set(0L)
+        if (!loggedFlush) {
+            loggedFlush = true
+            logger.info(
+                "$debugLabel audio line flushed ({}); emitted={} frames, queued PCM dropped.",
+                reason, totalWrittenFrames,
+            )
+        }
     }
 
     /**
@@ -380,7 +509,15 @@ internal class LibVlcAudioOutput(
      * pause is now driven explicitly by [setPaused] from the session manager's suspend/resume. */
     @Suppress("UNUSED_PARAMETER")
     fun onPause(data: Pointer?, pts: Long) {
-        resyncPending = false
+        // A pause must not leave the pre-pause tail queued. Flush on the audio thread here:
+        // waiting for the next onPlay never happens when the user pause stops callbacks.
+        val ln = line
+        if (ln != null) {
+            flushLineLocked(ln, "libvlc pause")
+            resyncPending = false
+        } else {
+            resyncPending = true
+        }
     }
 
     @Suppress("UNUSED_PARAMETER")
@@ -394,20 +531,18 @@ internal class LibVlcAudioOutput(
      */
     fun setPaused(value: Boolean) {
         paused = value
+        // Flush the queued tail on the next audio callback, before the first post-resume block.
+        resyncPending = true
+        if (!value) loggedFirstBlock = false
     }
 
-    /** Discards buffered PCM (seek / stop): pretend only the already-emitted frames exist. Does NOT touch
-     * the line — `SourceDataLine.flush()` / `getLongFramePosition()` on the native layer raced the
-     * audio thread's write and was the heap-corruption crash (0xC0000374) on pause/resume. The line is
-     * kept running and the stale buffered PCM is simply overwritten by the next [onPlay] blocks. */
+    /** Drops buffered PCM on seek / stop; serialized with the line writer by [lineLock]. */
     @Suppress("UNUSED_PARAMETER")
     fun onFlush(data: Pointer?, pts: Long) {
+        val ln = line
+        if (ln != null) flushLineLocked(ln, "libvlc flush") else cachedLeadNanos = null
         clockLive = false
-        // totalWrittenFrames is intentionally NOT reset to getLongFramePosition() here — that would
-        // touch the line cross-callback and risk the native race. The next block written by [onPlay]
-        // will re-anchor the clock naturally.
         resyncPending = false
-        cachedLeadNanos = null
     }
 
     /** Drains buffered PCM (end of stream). Does NOT touch the line — same native race reason. */
@@ -429,6 +564,9 @@ internal class LibVlcAudioOutput(
      * slave) vs. libvlc stopping audio output while the video continues.
      */
     fun audioFeedMs(): Long = totalWrittenFrames * FRAME_NANOS / 1_000_000L
+
+    /** PCM dropped by catch-up since the last reset; the audible audio is this much earlier. */
+    fun catchUpAppliedMs(): Long = catchUpAppliedFrames.get() * FRAME_NANOS / 1_000_000L
 
 
     /**
@@ -471,6 +609,7 @@ internal class LibVlcAudioOutput(
             clockLive = false
             resyncPending = false
             cachedLeadNanos = null
+            loggedFlush = false
             logger.info("$debugLabel audio line opened ({} Hz, {} ch).", SAMPLE_RATE, CHANNELS)
         } catch (e: LineUnavailableException) {
             logger.warn("$debugLabel audio line unavailable: ${e.message}.")

@@ -24,7 +24,7 @@ data class ClientDisplaySettings(
     var muted: Boolean = false,
 
     /** Whether the display is paused. */
-    var paused: Boolean = true,
+    var paused: Boolean = false,
 
     /** URL override for the video, or null if not overridden. */
     var urlOverride: String? = null,
@@ -46,6 +46,9 @@ data class ClientDisplaySettings(
 
     /** Last known playback position in nanoseconds, resumed on Local displays after a restart. */
     var savedTimeNanos: Long = 0,
+
+    /** URL that [savedTimeNanos] belongs to, or null for legacy entries. */
+    var savedVideoUrl: String? = null,
 
     /** Whether the viewer pinned this display to a Picture-in-Picture overlay; re-opened on rejoin regardless of render distance. */
     var pipOpen: Boolean = false,

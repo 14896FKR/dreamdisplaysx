@@ -169,6 +169,9 @@ enum class PlaylistCommandAction {
 
     /** Toggle playlist mode for the display, carried in the command's `enabled` flag. */
     SET_ENABLED,
+
+    /** Append every entry of the command's item list in one mutation (one persist, one broadcast). */
+    ADD_MANY,
     ;
 
     /** The append-only wire value for this action. */

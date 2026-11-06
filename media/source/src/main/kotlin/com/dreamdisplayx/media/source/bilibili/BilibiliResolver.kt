@@ -24,11 +24,29 @@ object BilibiliResolver : MediaResolverService {
      * serving e.g. 480p long after the user logged back in. */
     private val cache = LiveAwareResolvedMediaCache(maxSize = 64, liveTtlSeconds = 25, staticTtlMinutes = 0)
 
+    /** Shown when a video turns out to be a 360/VR panorama, which this mod cannot project. */
+    private const val PANORAMIC_MESSAGE =
+        "This is a 360/VR panorama video; Dream DisplaysX cannot project it onto a flat display yet."
+
+    /** Resolutions warmed by [prefetch], reusable once by the resolve that follows (queue preload). */
+    private val prefetchCache = java.util.concurrent.ConcurrentHashMap<String, PrefetchEntry>()
+
+    /** One warmed resolution and the instant it stops being reusable. */
+    private data class PrefetchEntry(val media: ResolvedMedia, val expiresAtNanos: Long)
+
+    /** How long a warmed resolution may wait for its consumer; a playlist advance lands well inside. */
+    private const val PREFETCH_TTL_NANOS = 90_000_000_000L
+
     override fun canResolve(source: MediaSource): Boolean = source is MediaSource.Bilibili
 
     override fun prefetch(source: MediaSource): Boolean {
         val bilibili = source as? MediaSource.Bilibili ?: return false
-        return runCatching { resolveCached(bilibili) }.isSuccess
+        val resolved = runCatching { resolveCached(bilibili) }.getOrNull() ?: return false
+        // Prefetched queue entries may be reused exactly once by the resolve that follows, which
+        // skips the playurl round trip; a quality switch resolves again and gets a fresh result.
+        val key = BilibiliMetadataCache.cacheKey(bilibili) ?: return true
+        prefetchCache[key] = PrefetchEntry(resolved, System.nanoTime() + PREFETCH_TTL_NANOS)
+        return true
     }
 
     override fun resolve(source: MediaSource): ResolvedMedia {
@@ -48,10 +66,20 @@ object BilibiliResolver : MediaResolverService {
         val key = BilibiliMetadataCache.cacheKey(source)
             ?: throw DreamMediaException.NotFound("Unrecognized Bilibili URL: ${source.url}.")
         cache.get(key)?.let { return it }
+        // A warmed entry is consumed here so it can serve only the next resolve.
+        prefetchCache.remove(key)?.let { warmed ->
+            if (System.nanoTime() < warmed.expiresAtNanos) {
+                logger.debug("Resolved Bilibili {} from the prefetch entry.", key)
+                return warmed.media
+            }
+        }
 
         val playback = BilibiliApi.resolve(source)
             ?: throw DreamMediaException.NotFound("Bilibili video/room could not be reached.")
         BilibiliMetadataCache.put(source, playback.metadata)
+
+        // A 360/VR panorama is equirectangular: on a flat display it is a warped sphere map.
+        if (playback.panoramic) throw DreamMediaException.NotFound(PANORAMIC_MESSAGE)
 
         if (playback.streams.isEmpty()) {
             throw DreamMediaException.NotFound(

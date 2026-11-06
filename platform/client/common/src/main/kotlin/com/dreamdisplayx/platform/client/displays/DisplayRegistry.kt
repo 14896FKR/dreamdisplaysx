@@ -10,6 +10,7 @@ import com.dreamdisplayx.api.storage.model.FullDisplayData
 import com.dreamdisplayx.core.services.DisplayStorage
 import com.dreamdisplayx.platform.client.core.DreamServices
 import com.dreamdisplayx.platform.client.render.ConformingWorldMesh
+import com.dreamdisplayx.media.player.managers.ResumePositionPolicy
 import com.dreamdisplayx.platform.client.storage.ClientSettingsStore
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -59,13 +60,18 @@ object DisplayRegistry {
         displayScreen.muted = clientSettings.muted
         displayScreen.acousticsEnabled = clientSettings.acousticsEnabled
         displayScreen.danmakuEnabled = clientSettings.danmakuEnabled
-        // Disk-persisted fallback (survives a full game restart); overridden below by the
-        // same-session cache when present, which is fresher.
-        displayScreen.savedTimeNanos = clientSettings.savedTimeNanos
+        // Fill from disk only when the caller did not already choose a position and the URL matches.
+        val savedMatchesVideo = clientSettings.savedVideoUrl.isNullOrEmpty() ||
+            clientSettings.savedVideoUrl == displayScreen.videoUrl
+        if (displayScreen.savedTimeNanos <= 0L && clientSettings.savedTimeNanos > 0L && savedMatchesVideo) {
+            displayScreen.savedTimeNanos = clientSettings.savedTimeNanos
+        }
         // Render distance follows the client's own chunk render distance on this fork.
         // The upstream persisted render-distance assignment is intentionally not applied.
         DisplayStorage.getDisplayData(displayScreen.uuid)?.let { saved ->
-            displayScreen.savedTimeNanos = saved.currentTimeNanos
+            if (displayScreen.savedTimeNanos <= 0L && saved.currentTimeNanos > 0L) {
+                displayScreen.savedTimeNanos = saved.currentTimeNanos
+            }
         }
 
         screens[displayScreen.uuid] = displayScreen
@@ -79,7 +85,7 @@ object DisplayRegistry {
             ClientSettingsStore.remove(displayScreen.uuid)
         } else {
             unloadedScreens[displayScreen.uuid] = displayScreen.toFullDisplayData()
-            ClientSettingsStore.setSavedTimeNanos(displayScreen.uuid, displayScreen.currentTimeNanos)
+            saveResumePosition(displayScreen)
         }
         screens.remove(displayScreen.uuid)
         displayScreen.unregister()
@@ -156,7 +162,25 @@ object DisplayRegistry {
     /** Saves the display screen data to disk. */
     fun saveScreenData(displayScreen: DisplayScreen) {
         DisplayStorage.saveDisplayData(displayScreen.uuid, displayScreen.toFullDisplayData())
-        ClientSettingsStore.setSavedTimeNanos(displayScreen.uuid, displayScreen.currentTimeNanos)
+        saveResumePosition(displayScreen)
+    }
+
+    /**
+     * Persists where playback should resume from. The rules (paused vs live clock, tail guard) live in
+     * [ResumePositionPolicy] so a headless test covers them; this only feeds it the live state.
+     */
+    private fun saveResumePosition(displayScreen: DisplayScreen) {
+        val position = ResumePositionPolicy.forSave(
+            ResumePositionPolicy.SaveInput(
+                paused = displayScreen.paused,
+                parkedNanos = displayScreen.parkedPositionNanos,
+                clockNanos = displayScreen.currentTimeNanos,
+                durationNanos = displayScreen.mediaPlayerDurationNanos,
+            ),
+        )
+        ClientSettingsStore.setSavedTimeNanos(displayScreen.uuid, position, displayScreen.videoUrl)
+        displayScreen.savedTimeNanos = position
+        displayScreen.reportPositionOnExit(position)
     }
 
     /** Restores the display snapshot cached for [serverId] (e.g. saved timecodes) from a prior session. */

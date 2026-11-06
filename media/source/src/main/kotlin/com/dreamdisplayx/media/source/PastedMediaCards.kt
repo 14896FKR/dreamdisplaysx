@@ -5,8 +5,8 @@ import com.dreamdisplayx.api.media.search.model.MediaSearchResult
 import com.dreamdisplayx.api.media.source.model.MediaPlatform
 import com.dreamdisplayx.api.media.source.model.MediaSource
 import com.dreamdisplayx.api.media.source.url.CustomMediaUrls
+import com.dreamdisplayx.api.media.source.url.MediaUrlCleaner
 import com.dreamdisplayx.api.media.source.url.YouTubeUrls
-import com.dreamdisplayx.api.security.policy.MediaUrlPolicy
 import com.dreamdisplayx.media.source.bilibili.BilibiliMetadataCache
 import com.dreamdisplayx.media.source.platform.PlatformVideoMetadata
 import com.dreamdisplayx.media.source.twitch.TwitchMetadata
@@ -17,7 +17,7 @@ import com.dreamdisplayx.media.source.twitch.TwitchMetadataCache
  *
  * Given a pasted media link (or bare YouTube id), builds the single [MediaSearchResult] card shown
  * instead of text-searching the URL string; returns null when the input is a plain search phrase.
- * Anything [MediaUrlPolicy] rejects stays a search phrase. Matching is keyword-free so a URL
+ * Anything [MediaUrlCleaner] rejects stays a search phrase. Matching is keyword-free so a URL
  * containing search terms is never half-search / half-card.
  *
  * Kept free of Minecraft / client types so the mapping is unit-testable on the JVM.
@@ -34,9 +34,7 @@ object PastedMediaCards {
      * pasted link still listed Bilibili search results instead of resolving to that one video.
      */
     fun fromQuery(query: String): MediaSearchResult? {
-        if (query.isBlank()) return null
-        val candidate = urlInText(query) ?: query.trim()
-        if (!MediaUrlPolicy.isAllowed(candidate)) return null
+        val candidate = MediaUrlCleaner.canonicalize(query) ?: return null
         val source = MediaSource.from(candidate)
         return when (source) {
             is MediaSource.YouTube -> fallbackResult(source.videoId)
@@ -50,28 +48,21 @@ object PastedMediaCards {
             // Bilibili URLs keep their platform badge; bangumi / episode / live URLs stay playable as-is.
             // Any metadata the cache already holds (a previously played / resolved link) fills in a real
             // title and thumbnail right away; the client enriches the card in the background otherwise.
-            is MediaSource.Bilibili -> bilibiliResult(
-                source,
-                BilibiliMetadataCache.cacheKey(source)?.let(BilibiliMetadataCache::get),
-            )
+            is MediaSource.Bilibili -> when {
+                // A media list / favourites folder and an uploader space are not playable on their own:
+                // their cards carry a prefixed id so the caller can route them to the right page.
+                source.mediaListId != null -> mediaListCard(source)
+                source.spaceMid != null -> spaceCard(source)
+                else -> bilibiliResult(
+                    source,
+                    BilibiliMetadataCache.cacheKey(source)?.let(BilibiliMetadataCache::get),
+                )
+            }
             is MediaSource.DirectStream -> customResult(source.streamUrl)
             is MediaSource.Remote -> customResult(source.url)
             is MediaSource.Ingest -> customResult(source.url)
         }
     }
-
-    /** Matches the first http(s) URL inside a pasted blob of text. */
-    private val URL_IN_TEXT = Regex("""https?://\S+""", RegexOption.IGNORE_CASE)
-
-    /** Punctuation a share sheet / chat message leaves stuck to the end of the URL. */
-    private const val URL_TRAILING = ".,;:!?)]}>\"'，。；：！？）】》”’"
-
-    /**
-     * The first URL embedded in [text] with trailing punctuation stripped, or null when the text
-     * carries no link (then it really is a search phrase).
-     */
-    private fun urlInText(text: String): String? =
-        URL_IN_TEXT.find(text)?.value?.trimEnd { it in URL_TRAILING }?.takeIf { it.isNotBlank() }
 
     /** Minimal result used when URL metadata could not be fetched. */
     private fun fallbackResult(videoId: String) =        MediaSearchResult(videoId, YouTubeUrls.watchUrl(videoId), null, null, null)
@@ -115,6 +106,64 @@ object PastedMediaCards {
         isLive = meta?.isLive ?: false,
         platform = platform,
     )
+
+    /** Card id prefix for a Bilibili favourites / media list; the suffix is the media id. */
+    const val MEDIA_LIST_PREFIX: String = "ml:"
+
+    /** Card id prefix for an uploader space; the suffix is the `mid`. */
+    const val SPACE_PREFIX: String = "space:"
+
+    /**
+     * Single card standing for a favourites / media list, routed to the playlist import on pick.
+     * [title] / [coverUrl] come from the list itself once the background lookup lands.
+     */
+    fun mediaListCard(
+        source: MediaSource.Bilibili,
+        title: String? = null,
+        coverUrl: String? = null,
+    ): MediaSearchResult {
+        val id = source.mediaListId ?: 0L
+        return MediaSearchResult(
+            id = MEDIA_LIST_PREFIX + id,
+            title = title?.takeIf { it.isNotBlank() } ?: "media list ml$id",
+            uploader = null,
+            durationSec = null,
+            viewCount = null,
+            watchUrlOverride = source.url,
+            thumbnailUrlOverride = coverUrl?.takeIf { it.isNotBlank() },
+            platform = MediaPlatform.BILIBILI,
+        )
+    }
+
+    /**
+     * Single card standing for an uploader space, routed to that creator's page on pick. [name] /
+     * [avatarUrl] / [fans] / [videos] come from the profile lookup once it lands, so the card reads
+     * like a creator card (avatar, name, follower and video counts) instead of a bare URL.
+     */
+    fun spaceCard(
+        source: MediaSource.Bilibili,
+        name: String? = null,
+        avatarUrl: String? = null,
+        fans: Long? = null,
+        videos: Long? = null,
+    ): MediaSearchResult {
+        val mid = source.spaceMid ?: 0L
+        return MediaSearchResult(
+            id = SPACE_PREFIX + mid,
+            title = name?.takeIf { it.isNotBlank() } ?: "space.bilibili.com/$mid",
+            uploader = null,
+            durationSec = null,
+            viewCount = null,
+            watchUrlOverride = source.url,
+            thumbnailUrlOverride = avatarUrl?.takeIf { it.isNotBlank() },
+            channelAvatarUrl = avatarUrl?.takeIf { it.isNotBlank() },
+            isUploader = true,
+            uploaderId = mid,
+            uploaderFans = fans,
+            uploaderVideoCount = videos,
+            platform = MediaPlatform.BILIBILI,
+        )
+    }
 
     /**
      * Builds a single-card result for a pasted Bilibili link. [meta] fills in the title / uploader /

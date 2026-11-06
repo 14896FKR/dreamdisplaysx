@@ -3,166 +3,62 @@ package com.dreamdisplayx.platform.server.managers
 import com.dreamdisplayx.platform.server.ModLoaderOnly
 import com.dreamdisplayx.platform.server.VanillaServerState
 import com.dreamdisplayx.platform.server.datatypes.selection.VanillaSelectionData
+import com.dreamdisplayx.platform.server.utils.OutlineGeometry
 import com.dreamdisplayx.platform.server.utils.RegionUtil
 import net.minecraft.core.particles.DustParticleOptions
+import net.minecraft.core.particles.ParticleOptions
 import net.minecraft.server.MinecraftServer
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
-import net.minecraft.world.phys.AABB
-//? if >=1.21.11 {
-//?} else
-/*import org.joml.Vector3f*/
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.ThreadFactory
-import java.util.concurrent.TimeUnit
-import kotlin.math.ceil
-import kotlin.math.max
-import kotlin.math.sqrt
+//? if <1.21.11 {
+import org.joml.Vector3f
+//?}
 
-/**
- * Draws the active selection box for Fabric and NeoForge players.
- *
- * Paper has a Bukkit-only scheduler and particle API, while the vanilla loaders share the
- * ServerLevel packet API. The small lifecycle-owned executor only enqueues work onto the server
- * thread; all selection reads and packet sends remain on that thread.
- */
+/** Draws particle outlines around the ready selections of players on `Fabric` / `NeoForge` servers. */
 @ModLoaderOnly
 object VanillaSelectionVisualizer {
-    private const val PARTICLE_SPACING = 0.5
-    private const val PARTICLE_SCALE = 0.5f
-    private const val CYAN_RGB = 0x00FFFF
+    private const val DUST_SCALE = 0.5f
 
-    private val lock = Any()
-    private var executor: ScheduledExecutorService? = null
-    private var task: ScheduledFuture<*>? = null
-
-    /** Starts the repeating particle task for [server], replacing a task from a prior world. */
-    fun startParticleTask(server: MinecraftServer) {
-        if (!VanillaServerState.config.settings.particlesEnabled) return
-        synchronized(lock) {
-            stopLocked()
-            val threadFactory = ThreadFactory { runnable ->
-                Thread(runnable, "DreamDisplaysX-selection-particles").apply { isDaemon = true }
-            }
-            val service = Executors.newSingleThreadScheduledExecutor(threadFactory)
-            executor = service
-            val periodTicks = max(1, VanillaServerState.config.settings.particleRenderDelay)
-            task = service.scheduleAtFixedRate(
-                { server.execute { render(server) } },
-                0L,
-                periodTicks * 50L,
-                TimeUnit.MILLISECONDS,
-            )
-        }
-    }
-
-    /** Stops the task when the loader tears down the server. */
-    fun stopParticleTask() {
-        synchronized(lock) { stopLocked() }
-    }
-
-    private fun stopLocked() {
-        task?.cancel(false)
-        task = null
-        executor?.shutdownNow()
-        executor = null
-    }
-
-    private fun render(server: MinecraftServer) {
-        if (!VanillaServerState.config.settings.particlesEnabled) return
-        val options = cyanDust()
-        SelectionManager.selectionPoints.forEach { (playerId, rawSelection) ->
-            val selection = rawSelection as? VanillaSelectionData ?: return@forEach
-            if (!selection.isReady) return@forEach
-            if (selection.pos1 == null || selection.pos2 == null) return@forEach
-            val worldKey = selection.worldKey ?: return@forEach
+    /** Draws every ready selection to the player who made it, when that player is still in the selection's world. */
+    fun tick(server: MinecraftServer) {
+        val dust = dust(VanillaServerState.config.settings.particleColorRgb)
+        SelectionManager.selectionPoints.forEach { (playerId, selection) ->
+            if (selection !is VanillaSelectionData || !selection.isReady) return@forEach
             val player = server.playerList.getPlayer(playerId) ?: return@forEach
+            val pos1 = selection.pos1 ?: return@forEach
+            val pos2 = selection.pos2 ?: return@forEach
+            val worldKey = selection.worldKey ?: return@forEach
             if (RegionUtil.getPlayerLevelKey(player) != worldKey) return@forEach
             val level = RegionUtil.getLevelByKey(server, worldKey) ?: return@forEach
-            val box = selection.selectionBox() ?: return@forEach
-            drawBox(level, player, box, options)
+
+            val region = RegionUtil.calculateRegion(pos1, pos2)
+            OutlineGeometry.forEachPoint(
+                region.minX.toDouble(), region.minY.toDouble(), region.minZ.toDouble(),
+                (region.maxX + 1).toDouble(), (region.maxY + 1).toDouble(), (region.maxZ + 1).toDouble(),
+            ) { x, y, z -> send(level, player, dust, x, y, z) }
         }
     }
 
-    private fun drawBox(level: ServerLevel, player: ServerPlayer, box: AABB, options: DustParticleOptions) {
-        drawLine(level, player, options, box.minX, box.minY, box.minZ, box.maxX, box.minY, box.minZ)
-        drawLine(level, player, options, box.maxX, box.minY, box.minZ, box.maxX, box.minY, box.maxZ)
-        drawLine(level, player, options, box.maxX, box.minY, box.maxZ, box.minX, box.minY, box.maxZ)
-        drawLine(level, player, options, box.minX, box.minY, box.maxZ, box.minX, box.minY, box.minZ)
+    private fun dust(rgb: Int): ParticleOptions =
+        //? if >=1.21.11 {
+        DustParticleOptions(rgb, DUST_SCALE)
+    //?} else
+    /*
+    //? if >=1.19.3 {
+    DustParticleOptions(Vector3f((rgb shr 16 and 0xFF) / 255f, (rgb shr 8 and 0xFF) / 255f, (rgb and 0xFF) / 255f), DUST_SCALE)
+    //?}
+    //? if <1.19.3 {
+    DustParticleOptions(
+        com.mojang.math.Vector3f((rgb shr 16 and 0xFF) / 255f, (rgb shr 8 and 0xFF) / 255f, (rgb and 0xFF) / 255f), DUST_SCALE,
+    )
+    //?}
+    */
 
-        drawLine(level, player, options, box.minX, box.maxY, box.minZ, box.maxX, box.maxY, box.minZ)
-        drawLine(level, player, options, box.maxX, box.maxY, box.minZ, box.maxX, box.maxY, box.maxZ)
-        drawLine(level, player, options, box.maxX, box.maxY, box.maxZ, box.minX, box.maxY, box.maxZ)
-        drawLine(level, player, options, box.minX, box.maxY, box.maxZ, box.minX, box.maxY, box.minZ)
-
-        drawLine(level, player, options, box.minX, box.minY, box.minZ, box.minX, box.maxY, box.minZ)
-        drawLine(level, player, options, box.maxX, box.minY, box.minZ, box.maxX, box.maxY, box.minZ)
-        drawLine(level, player, options, box.maxX, box.minY, box.maxZ, box.maxX, box.maxY, box.maxZ)
-        drawLine(level, player, options, box.minX, box.minY, box.maxZ, box.minX, box.maxY, box.maxZ)
-    }
-
-    private fun drawLine(
-        level: ServerLevel,
-        player: ServerPlayer,
-        options: DustParticleOptions,
-        fromX: Double,
-        fromY: Double,
-        fromZ: Double,
-        toX: Double,
-        toY: Double,
-        toZ: Double,
-    ) {
-        val dx = toX - fromX
-        val dy = toY - fromY
-        val dz = toZ - fromZ
-        val points = max(1, ceil(sqrt(dx * dx + dy * dy + dz * dz) / PARTICLE_SPACING).toInt())
-        for (index in 0..points) {
-            val fraction = index.toDouble() / points
-            sendParticle(
-                level,
-                player,
-                options,
-                fromX + dx * fraction,
-                fromY + dy * fraction,
-                fromZ + dz * fraction,
-            )
-        }
-    }
-
-    private fun sendParticle(
-        level: ServerLevel,
-        player: ServerPlayer,
-        options: DustParticleOptions,
-        x: Double,
-        y: Double,
-        z: Double,
-    ) {
+    private fun send(level: ServerLevel, player: ServerPlayer, options: ParticleOptions, x: Double, y: Double, z: Double) {
         //? if >=1.21.11 {
         level.sendParticles(player, options, false, false, x, y, z, 1, 0.0, 0.0, 0.0, 0.0)
         //?} else
         /*level.sendParticles(player, options, false, x, y, z, 1, 0.0, 0.0, 0.0, 0.0)*/
     }
 
-    private fun cyanDust(): DustParticleOptions =
-        //? if >=1.21.11 {
-        DustParticleOptions(CYAN_RGB, PARTICLE_SCALE)
-        //?} else
-        /*DustParticleOptions(cyanVector(), PARTICLE_SCALE)*/
-
-    /**
-     * `DustParticleOptions` takes a joml `Vector3f` from 1.19 but still wants Mojang's own vector
-     * class on 1.18.2. Kept as its own single-level gate: nesting `//? if` inside a commented else
-     * block makes the chisel parser treat the inner directive as top-level. The outer gate also
-     * keeps the function out of the 1.21.11+ sources, where the constructor takes an int rgb and
-     * `Vector3f` is not imported at all.
-     */
-    //? if <1.21.11 {
-    private fun cyanVector() =
-        //? if >=1.19 {
-        Vector3f(0f, 1f, 1f)
-        //?} else
-        /*com.mojang.math.Vector3f(0f, 1f, 1f)*/
-    //?}
 }

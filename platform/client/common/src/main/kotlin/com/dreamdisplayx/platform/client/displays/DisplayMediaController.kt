@@ -3,6 +3,7 @@ package com.dreamdisplayx.platform.client.displays
 import com.dreamdisplayx.api.media.service.keys.MediaServices
 import com.dreamdisplayx.api.media.audio.service.keys.AudioAcousticsServices
 import com.dreamdisplayx.api.media.source.model.MediaSource
+import com.dreamdisplayx.api.playback.model.PlaybackMode
 import com.dreamdisplayx.core.protocol.common.packets.ReportDuration
 import com.dreamdisplayx.media.player.MediaPlayer
 import com.dreamdisplayx.platform.client.Initializer
@@ -196,6 +197,8 @@ internal class DisplayMediaController(private val screen: DisplayScreen) {
         val newPlayer = MediaPlayer(
             videoUrl, lang, DisplayPlaybackHost(screen), DreamPlaybackEnvironment,
             screen.takeReplayBootstrap(videoUrl), audioStage,
+            initialPositionNanos = if (screen.mode == PlaybackMode.LOCAL) screen.savedTimeNanos else 0L,
+            startPaused = shouldBePaused,
         )
 
         // A newer load may have arrived while MediaPlayer resolved its constructor arguments. Do
@@ -255,13 +258,14 @@ internal class DisplayMediaController(private val screen: DisplayScreen) {
         // the vout thread uploads native-size frames with a direct bulk copy and the GPU does the scaling
         // — otherwise every frame would be CPU-rescaled on the vout thread (the 10-20fps regression).
         Minecraft.getInstance().execute { screen.reloadTexture() }
-        if (screen.paused) mp.pause() else {
+        if (screen.paused) {
+            // The constructor already primed the saved position; keep the session paused until resume.
+            mp.pause()
+            screen.paused = true
+        } else {
             mp.play()
             screen.paused = false
         }
-        // A replay-bootstrap player already resumes at the saved position; restoreSavedTime()'s
-        // corrective seek would cold-restart the session and destroy the seamless replay -> live bridge.
-        if (!mp.isResumingFromReplay()) screen.restoreSavedTime()
         DisplayRegistry.recordScreen(screen)
     }
 
@@ -287,6 +291,19 @@ internal class DisplayMediaController(private val screen: DisplayScreen) {
             screen.mediaError = null
             action()
         }
+    }
+
+    /** Stops and drops the current player, leaving this controller usable for a later [load]. */
+    fun stopPlayback() {
+        val current = synchronized(loadLock) {
+            generation.incrementAndGet()
+            pendingLoad = null
+            videoStarted = false
+            val previous = player
+            player = null
+            previous
+        }
+        current?.let { runCatching { it.stopAsync() } }
     }
 
     /** Detaches the current player and invalidates pending callbacks; returns it for final teardown. */

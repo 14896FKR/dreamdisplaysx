@@ -29,6 +29,9 @@ object PlaylistManager {
     /** Zero UUID used by protobuf defaults for absent optional item identities. */
     private val ZERO_UUID = UUID(0L, 0L)
 
+    /** Upper bound on entries accepted by one ADD_MANY, so a hostile packet cannot flood the queue. */
+    private const val MAX_BATCH_ADD = 300
+
     /** Live platform transport, injected at startup. */
     private lateinit var transport: PlaybackTransport
 
@@ -87,14 +90,15 @@ object PlaylistManager {
             PlaylistCommandAction.NEXT,
             -> if (!isOwner && !isSenderAdmin) return false
 
-            PlaylistCommandAction.ADD -> {
+            PlaylistCommandAction.ADD,
+            PlaylistCommandAction.ADD_MANY -> {
                 val policy = playlist.enqueuePolicy
                 val mayDirect = isOwner || isSenderAdmin ||
                     policy == PlaylistEnqueuePolicy.EVERYONE
                 if (!mayDirect && !(policy == PlaylistEnqueuePolicy.OWNER_APPROVAL)) {
                     logger.warn(
-                        "rejected playlist ADD from {} for display {}: enqueuePolicy={}, isOwner={}, isAdmin={}",
-                        senderName, display.id, policy, isOwner, isSenderAdmin,
+                        "rejected playlist {} from {} for display {}: enqueuePolicy={}, isOwner={}, isAdmin={}",
+                        action, senderName, display.id, policy, isOwner, isSenderAdmin,
                     )
                     return false
                 }
@@ -135,6 +139,35 @@ object PlaylistManager {
                 items.add(at, item)
                 // Keep the same current item selected after insertion, irrespective of whether the
                 // inserted row is pending or approved immediately.
+                playlist.copy(
+                    items = items,
+                    currentIndex = remapCurrentIndex(playlist.items, items, playlist.currentIndex),
+                )
+            }
+
+            PlaylistCommandAction.ADD_MANY -> {
+                val pending = playlist.enqueuePolicy == PlaylistEnqueuePolicy.OWNER_APPROVAL &&
+                    !isOwner && !isSenderAdmin
+                val incoming = packet.items.asSequence()
+                    .filter { it.url.isNotBlank() }
+                    .take(MAX_BATCH_ADD)
+                    .toList()
+                if (incoming.isEmpty()) return false
+                val items = playlist.items.toMutableList()
+                for (entry in incoming) {
+                    items.add(
+                        PlaylistItemRecord(
+                            itemId = UUID.randomUUID(),
+                            url = entry.url.trim(),
+                            lang = entry.lang.trim().ifEmpty { packet.lang.trim() },
+                            title = entry.title.trim().take(255),
+                            pending = pending,
+                            requesterId = senderId,
+                            requesterName = senderName.trim().take(32),
+                        ),
+                    )
+                }
+                logger.debug("playlist ADD_MANY: appended {} item(s) for display {}", incoming.size, display.id)
                 playlist.copy(
                     items = items,
                     currentIndex = remapCurrentIndex(playlist.items, items, playlist.currentIndex),

@@ -67,8 +67,12 @@ class SettingsSection(
     private var clipLeft = 0
     private var clipRight = 0
 
+    /** Outer horizontal bounds of this panel, so the wheel only scrolls the panel it is over. */
+    private var panelLeft = 0
+    private var panelRight = 0
+
     /** Draws all rows into [panel] and places the owner action buttons in its bottom-right corner. */
-    fun render(g: GuiGraphicsCompat, panel: UiRect, mouseX: Int, mouseY: Int) {
+    fun render(g: GuiGraphicsCompat, panel: UiRect, mouseX: Int, mouseY: Int, uiScale: Double = 1.0) {
         val font = Minecraft.getInstance().font
         val innerX = panel.x + UiTheme.PANEL_PADDING_X
         val innerW = panel.w - UiTheme.PANEL_PADDING_X * 2
@@ -78,9 +82,13 @@ class SettingsSection(
         // width and left edge, instead of each being squeezed by its own label length.
         val labelColW = rows.maxOf { font.width(translatableText(it.labelKey)) }
 
-        // Row area spans from below the title up to the owner-action row at the bottom.
+        // Row area spans from below the title up to the owner-action row at the bottom. The top and
+        // bottom gap are both 6px so the last row does not sit farther from the buttons than the
+        // first row sits from the title.
         areaTop = titleH
-        areaBottom = panel.bottom - UiTheme.PANEL_PADDING_Y - UiTheme.CONTROL_BUTTON - 6
+        areaBottom = panel.bottom - UiTheme.PANEL_PADDING_Y - UiTheme.CONTROL_BUTTON
+        panelLeft = panel.x
+        panelRight = panel.right
         val areaH = max(0, areaBottom - areaTop)
 
         val contentH = rows.sumOf { it.extraGapBefore + UiTheme.ROW_H } +
@@ -89,12 +97,26 @@ class SettingsSection(
         scrollOffset = scrollOffset.coerceIn(0, maxScroll)
         clipLeft = panel.x + UiTheme.PANEL_PADDING_X
         clipRight = panel.right - UiTheme.PANEL_PADDING_X
+        val clipScreen = UiRect(
+            (clipLeft * uiScale).toInt(),
+            (areaTop * uiScale).toInt(),
+            ((clipRight - clipLeft) * uiScale).toInt(),
+            ((areaBottom - areaTop) * uiScale).toInt(),
+        )
 
-        var rowY = titleH - scrollOffset
-        for (row in rows) {
-            rowY += row.extraGapBefore
-            renderRow(g, row, innerX, rowY, innerW, labelColW, areaTop, areaBottom)
-            rowY += UiTheme.ROW_H + UiTheme.ROW_GAP
+        // Clip row backgrounds and labels too. The old code only skipped fully off-screen rows;
+        // a partially visible row painted its label above the scroll area, which looked like the
+        // 3D-audio row jumping over the title while scrolling.
+        g.enableScissor(clipScreen.x, clipScreen.y, clipScreen.right, clipScreen.bottom)
+        try {
+            var rowY = titleH - scrollOffset
+            for (row in rows) {
+                rowY += row.extraGapBefore
+                renderRow(g, row, innerX, rowY, innerW, labelColW, areaTop, areaBottom, clipScreen)
+                rowY += UiTheme.ROW_H + UiTheme.ROW_GAP
+            }
+        } finally {
+            g.disableScissor()
         }
 
         drawScrollbar(g, panel, areaTop, areaBottom, areaH, mouseY)
@@ -111,14 +133,18 @@ class SettingsSection(
         labelColW: Int,
         clipTop: Int,
         clipBottom: Int,
+        clipScreen: UiRect,
     ) {
         val font = Minecraft.getInstance().font
 
-        // Rows fully outside the visible area are moved off-screen so drawChildren never
-        // paints them; visible rows are placed at their correct scroll position.
+        // Rows outside the visible area are moved off-screen. Partially visible rows keep their
+        // background/label and let the widget-level clip keep their controls inside the scroll area.
         val visible = y + UiTheme.ROW_H > clipTop && y < clipBottom
+        val fullyVisible = y >= clipTop && y + UiTheme.ROW_H <= clipBottom
         val placeY = if (visible) y else -9999
         var rightEdge = x + w
+        row.reset.clipScreenRect = clipScreen
+        row.control.clipScreenRect = clipScreen
         row.reset.place(UiRect(rightEdge - UiTheme.RESET_W, placeY, UiTheme.RESET_W, UiTheme.ROW_H))
         rightEdge -= UiTheme.RESET_W + 4
         val controlW = min(UiTheme.CONTROL_W, max(60, rightEdge - (x + 6 + labelColW + 8)))
@@ -135,7 +161,7 @@ class SettingsSection(
         val label = translatableText(row.labelKey)
         val textY = y + UiTheme.ROW_H / 2 - font.lineHeight / 2
         g.drawText(font, label, x + 6, textY, UiTheme.TEXT_PRIMARY, false)
-        row.labelHover = UiRect(x + 6, textY, font.width(label), font.lineHeight)
+        row.labelHover = if (fullyVisible) UiRect(x + 6, textY, font.width(label), font.lineHeight) else null
     }
 
     /** Hides or shows every control owned by the settings panel (rows + owner actions). */
@@ -188,7 +214,9 @@ class SettingsSection(
     fun handleScroll(mouseX: Int, mouseY: Int, scrollY: Double): Boolean {
         if (maxScroll <= 0) return false
         if (mouseY < areaTop || mouseY > areaBottom) return false
-        if (mouseX < 0 || mouseX > barX + 4) return false
+        // Bound by this panel's own rect: a bare `mouseX > barX + 4` let the wheel over the preview
+        // panel scroll this one, which read as "the right column scrolls by itself".
+        if (mouseX < panelLeft || mouseX > panelRight) return false
         scrollOffset = (scrollOffset - scrollY.toInt() * SCROLL_STEP).coerceIn(0, maxScroll)
         return true
     }
@@ -235,7 +263,8 @@ class SettingsSection(
     private fun placeOwnerActions(panel: UiRect) {
         val btn = UiTheme.CONTROL_BUTTON
         var rightEdge = panel.right - UiTheme.PANEL_PADDING_X
-        val yEdge = panel.bottom - UiTheme.PANEL_PADDING_Y - btn
+        // Sit lower with a small bottom margin so the last settings row stays clear above.
+        val yEdge = panel.bottom - UiTheme.PANEL_PADDING_Y - btn + 6
         for (b in ownerActions) {
             if (b == null || !b.visible) continue
             b.place(UiRect(rightEdge - btn, yEdge, btn, btn))

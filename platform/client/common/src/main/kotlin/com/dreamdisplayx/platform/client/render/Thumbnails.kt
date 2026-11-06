@@ -213,7 +213,7 @@ object Thumbnails {
             .onFailure { e ->
                 if (e is CancellationException) throw e
 
-                logger.warn("Fetch failed for $cacheKey: ${e.message}.")
+                logger.debug("Fetch failed for $cacheKey: ${e.message}.")
                 BYTES.invalidate(cacheKey)
                 IN_FLIGHT.invalidate(cacheKey)
                 FAILED.put(cacheKey, true)
@@ -378,30 +378,36 @@ object Thumbnails {
         }
     }
 
-    /** Downloads raw image bytes from [url]; returns null on any HTTP or network error. */
+    /** Downloads raw image bytes from [url]; retries one transient failure before giving up. */
     private fun fetch(url: String): ByteArray? {
-        return try {
-            val response = DreamHttpClient.execute(
-                url,
-                DreamHttpClient.RequestOptions(
-                    headers = DreamHttpClient.headersOf(
-                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                        "Accept" to "image/jpeg,image/png,image/webp",
-                        *listOfNotNull(refererFor(url)?.let { "Referer" to it }).toTypedArray(),
+        var lastFailure: Exception? = null
+        repeat(2) { attempt ->
+            try {
+                val response = DreamHttpClient.execute(
+                    url,
+                    DreamHttpClient.RequestOptions(
+                        headers = DreamHttpClient.headersOf(
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                            "Accept" to "image/jpeg,image/png,image/webp",
+                            *listOfNotNull(refererFor(url)?.let { "Referer" to it }).toTypedArray(),
+                        ),
+                        connectTimeoutMs = 8_000,
+                        readTimeoutMs = 15_000,
                     ),
-                    connectTimeoutMs = 8_000,
-                    readTimeoutMs = 15_000,
-                ),
-            )
-            if (response.code != 200) {
+                )
+                if (response.code == 200) return response.body
+                if (response.code in 500..599 && attempt == 0) {
+                    Thread.sleep(250)
+                    return@repeat
+                }
                 logger.warn("Thumbnail fetch got HTTP ${response.code} for $url.")
-                null
-            } else {
-                response.body
+                return null
+            } catch (e: Exception) {
+                lastFailure = e
+                if (attempt == 0) runCatching { Thread.sleep(250) }
             }
-        } catch (e: Exception) {
-            logger.warn("Thumbnail fetch failed for $url.", e)
-            null
         }
+        logger.warn("Thumbnail fetch failed for $url: ${lastFailure?.message ?: "unknown"}.")
+        return null
     }
 }

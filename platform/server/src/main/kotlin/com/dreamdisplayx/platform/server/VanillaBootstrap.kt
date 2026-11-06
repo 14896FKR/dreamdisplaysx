@@ -6,6 +6,7 @@ import com.dreamdisplayx.platform.server.credentials.SqlCredentialSyncBackend
 import com.dreamdisplayx.platform.server.ModLoaderOnly
 import com.dreamdisplayx.platform.server.managers.DisplayManager
 import com.dreamdisplayx.platform.server.managers.StorageManager
+import com.dreamdisplayx.platform.server.managers.VanillaSelectionVisualizer
 import com.dreamdisplayx.platform.server.meta.ServerCoroutines
 import com.dreamdisplayx.platform.server.meta.Updater
 import com.dreamdisplayx.platform.server.playback.*
@@ -120,6 +121,15 @@ object VanillaBootstrap {
                         FullscreenBroadcastManager.tick()
                         VanillaProxyBridge.tick(server)
                     }
+                }
+            }
+        }
+
+        if (settings.particlesEnabled) {
+            ServerCoroutines.io.launch {
+                while (!server.isStopped) {
+                    delay((settings.particleRenderDelay * 50L).milliseconds)
+                    runCatching { server.execute { VanillaSelectionVisualizer.tick(server) } }
                 }
             }
         }

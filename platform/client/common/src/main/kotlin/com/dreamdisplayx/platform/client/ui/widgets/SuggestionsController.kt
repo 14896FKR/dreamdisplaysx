@@ -3,6 +3,7 @@ package com.dreamdisplayx.platform.client.ui.widgets
 import com.dreamdisplayx.api.media.service.keys.MediaServices
 import com.dreamdisplayx.api.media.search.model.MediaSearchResult
 import com.dreamdisplayx.api.media.source.url.CustomMediaUrls
+import com.dreamdisplayx.api.media.source.url.MediaUrlCleaner
 import com.dreamdisplayx.api.media.source.model.MediaPlatform
 import com.dreamdisplayx.api.media.source.model.MediaSource
 import com.dreamdisplayx.api.security.policy.AdultContentFilter
@@ -12,6 +13,7 @@ import com.dreamdisplayx.media.source.bilibili.BilibiliApi
 import com.dreamdisplayx.media.source.bilibili.BilibiliMetadataCache
 import com.dreamdisplayx.media.source.bilibili.BilibiliSearchItem
 import com.dreamdisplayx.media.source.bilibili.BilibiliSearchType
+import com.dreamdisplayx.media.source.bilibili.BilibiliUserItem
 import com.dreamdisplayx.media.source.kick.KickMetadataCache
 import com.dreamdisplayx.media.source.twitch.TwitchApi
 import com.dreamdisplayx.media.source.twitch.TwitchMetadata
@@ -80,12 +82,31 @@ class SuggestionsController {
     /** The last non-empty text search query, so [setSort] knows what to re-run for a network sort change. */
     private var lastQuery: String? = null
 
+    /** Current search target; `UPLOADER` shows UP cards before drilling into a video list. */
+    var searchScope: SearchScope = SearchScope.VIDEO
+        private set
+
+    /** Search keyword carried from `keyword@uploader` until the user picks a fuzzy result. */
+    private var pendingUploaderKeyword: String = ""
+
+    /** Keyword to pass into the standalone uploader screen when a UP card is clicked. */
+    val uploaderKeywordForPick: String get() = pendingUploaderKeyword
+
     /**
      * Text currently in the search box. Owned here rather than by the [SuggestionsPanel] because
      * Minecraft rebuilds every screen child on [DisplayMenu.init] whenever the window is resized — a
      * fresh EditBox would otherwise come up empty and the user's pasted link would be lost.
      */
     var searchText: String = ""
+
+    /** Called when a pasted Bilibili link should be played immediately instead of waiting for a card click. */
+    var onDirectBilibiliPick: ((MediaSearchResult) -> Unit)? = null
+
+    /**
+     * Writes [text] back into the search box; the panel owns the widget, so the controller only asks.
+     * Used to leave a cleaned link in the box after a paste instead of the raw share text.
+     */
+    var onRewriteSearchText: ((String) -> Unit)? = null
 
     /** How to continue the current result list when [loadMoreIfNeeded] fires; null when the current
      *  list isn't paginable (single-video / Twitch-only results). */
@@ -109,6 +130,7 @@ class SuggestionsController {
     /** Distinguishes what a follow-up "load more" page should continue: a text search or a related-video list. */
     private sealed class MoreMode {
         data class Search(val query: String) : MoreMode()
+        data class UserSearch(val query: String) : MoreMode()
         data class Related(val videoId: String) : MoreMode()
     }
 
@@ -122,6 +144,8 @@ class SuggestionsController {
         if (videoId == currentVideoId && cards.isNotEmpty()) return
         currentVideoId = videoId
         lastQuery = null
+        searchScope = SearchScope.VIDEO
+        pendingUploaderKeyword = ""
         loadRelated(videoId)
     }
 
@@ -148,6 +172,113 @@ class SuggestionsController {
         return true
     }
 
+    /** Switches between video and uploader search and re-runs the current query. */
+    fun setSearchScope(scope: SearchScope) {
+        if (scope == searchScope) return
+        val query = lastQuery
+        searchScope = scope
+        pendingUploaderKeyword = ""
+        sortOption = SortOption.RELEVANCE
+        onResults()
+        if (query.isNullOrBlank()) {
+            clearSearch()
+        } else if (scope == SearchScope.VIDEO) {
+            val plain = query.substringBefore('@').trim()
+            if (plain.isEmpty()) clearSearch() else runSearch(plain)
+        } else {
+            runSearch(query)
+        }
+    }
+
+    /** Clears all result state as soon as the search box becomes empty. */
+    fun clearSearch() {
+        requestSeq.incrementAndGet()
+        currentVideoId = null
+        lastQuery = null
+        pendingUploaderKeyword = ""
+        cards.clear()
+        pendingResults = emptyList()
+        pendingOffset = 0
+        pendingPage = 1
+        moreMode = null
+        continuationToken = null
+        loadStatusKey = null
+        loadingMore = false
+        sortOption = SortOption.RELEVANCE
+        onResults()
+    }
+
+    /** Called by the search box responder; an empty box must not leave old cards on screen. */
+    fun onSearchTextChanged(text: String) {
+        // A jump of more than one character is a paste, not typing: clean the link in place so the
+        // box holds the playable URL instead of the share text with its tracking parameters.
+        val pasted = text.length - searchText.length > 1
+        searchText = text
+        if (text.isBlank()) {
+            clearSearch()
+            return
+        }
+        if (pasted) rewriteLinkText(text)
+    }
+
+    /** Replaces [text] in the box with its cleaned link form; returns true when it changed. */
+    private fun rewriteLinkText(text: String): Boolean {
+        val cleaned = MediaUrlCleaner.canonicalize(text) ?: return false
+        if (cleaned == text) return false
+        searchText = cleaned
+        onRewriteSearchText?.invoke(cleaned)
+        return true
+    }
+
+    private fun loadUsers(query: String) {
+        startLoad()
+        val seq = requestSeq.incrementAndGet()
+        launchLoad {
+            val results = runCatching {
+                withContext(Dispatchers.IO) { BilibiliApi.searchUsers(query) }
+                    .filter { !AdultContentFilter.isExplicit(it.name, it.signature) }
+                    .sortedWith(userRank(query))
+                    .map(::uploaderResult)
+            }.onFailure { e ->
+                if (e is CancellationException) throw e
+                logger.warn("Bilibili uploader search failed: ${e.message}")
+            }.getOrNull()
+            if (results != null) publish(seq, results, null, mode = MoreMode.UserSearch(query))
+            else publish(seq, null, KEY_ERROR)
+        }
+    }
+
+    private fun uploaderResult(item: BilibiliUserItem): MediaSearchResult = MediaSearchResult(
+        id = "bili-user-${item.mid}",
+        title = item.name,
+        uploader = item.signature,
+        durationSec = null,
+        viewCount = item.videoCount,
+        watchUrlOverride = "https://space.bilibili.com/${item.mid}",
+        thumbnailUrlOverride = item.avatarUrl,
+        platform = MediaPlatform.BILIBILI,
+        channelAvatarUrl = item.avatarUrl,
+        isVerified = item.verified,
+        isUploader = true,
+        uploaderId = item.mid,
+        uploaderFans = item.fans,
+        uploaderVideoCount = item.videoCount,
+    )
+
+    /** Keeps exact and prefix uploader-name matches above looser API ordering. */
+    private fun userRank(query: String): Comparator<BilibiliUserItem> {
+        val needle = query.trim().lowercase()
+        return compareBy<BilibiliUserItem> {
+            val name = it.name.lowercase()
+            when {
+                name == needle -> 0
+                name.startsWith(needle) -> 1
+                name.contains(needle) -> 2
+                else -> 3
+            }
+        }.thenByDescending { it.fans ?: 0L }
+    }
+
     /**
      * Runs a Bilibili-only free-text search. This fork's search is Bilibili-exclusive; it queries the
      * three Bilibili categories (video / bangumi / movie), ranks them by relevance, then publishes
@@ -155,14 +286,37 @@ class SuggestionsController {
      * related list.
      */
     fun runSearch(query: String) {
-        val q = query.trim()
+        val input = query.trim()
+        // Searching a link means playing it, so run the cleaned form and leave that in the box too.
+        val raw = MediaUrlCleaner.canonicalize(input)?.also { cleaned ->
+            if (cleaned != input) {
+                searchText = cleaned
+                onRewriteSearchText?.invoke(cleaned)
+            }
+        } ?: input
+        val parsed = SearchQueryParser.parse(raw, searchScope)
+        val q = parsed.keyword
+        logger.debug("Search query raw='{}', keyword='{}', scope={}.", raw, q, parsed.scope)
 
-        if (q.isEmpty()) {
-            lastQuery = null
-            val currentId = currentVideoId
-            if (currentId != null) loadRelated(currentId)
+        if (raw.isEmpty()) {
+            clearSearch()
             return
         }
+
+        if (parsed.scope == SearchScope.UPLOADER) {
+            val userQuery = parsed.uploaderName ?: q
+            if (userQuery.isBlank()) {
+                clearSearch()
+                return
+            }
+            searchScope = SearchScope.UPLOADER
+            lastQuery = raw
+            pendingUploaderKeyword = SearchQueryParser.uploaderVideoKeyword(parsed)
+            loadUsers(userQuery)
+            return
+        }
+
+        searchScope = SearchScope.VIDEO
 
         // Pasting into the box is a request to play that link, so leaving a local-list filter
         // active would hide the result the player just asked for.
@@ -173,6 +327,10 @@ class SuggestionsController {
         // search phrase.
         val pasted = pastedResultOrNull(q)
         if (pasted != null) {
+            // A media list / uploader space card is a page shortcut, never a play request.
+            val routeCard = pasted.id.startsWith(PastedMediaCards.SPACE_PREFIX) ||
+                pasted.id.startsWith(PastedMediaCards.MEDIA_LIST_PREFIX)
+            val playDirectly = lastQuery != q && pasted.platform == MediaPlatform.BILIBILI && !routeCard
             lastQuery = q
             startLoad()
             val seq = requestSeq.incrementAndGet()
@@ -181,17 +339,13 @@ class SuggestionsController {
             // append its search results underneath the card — the reported "pasting a link still
             // lists other videos from Bilibili search".
             publish(seq, listOf(pasted), null)
-            // A pasted Bilibili link starts as a URL-fallback card when its metadata is not cached
+            if (playDirectly) onDirectBilibiliPick?.invoke(pasted)
+            // A pasted Bilibili link starts as a URL-fallback card when its metadata is not known
             // yet; resolve it in the background and re-publish the enriched card once the real
-            // title / thumbnail land, so the paste flow shows a proper card instead of a bare URL.
+            // title / thumbnail / avatar land, so the paste flow shows a proper card instead of a
+            // bare URL.
             if (pasted.platform == MediaPlatform.BILIBILI && pasted.thumbnailUrlOverride == null) {
-                launchLoad {
-                    val source = MediaSource.from(q) as? MediaSource.Bilibili
-                    val meta = source?.let { BilibiliMetadataCache.resolveBlocking(it) }
-                    if (source != null && meta != null && requestSeq.value == seq) {
-                        publish(seq, listOf(PastedMediaCards.bilibiliResult(source, meta)), null)
-                    }
-                }
+                enrichPasted(seq, q)
             }
             return
         }
@@ -204,8 +358,12 @@ class SuggestionsController {
             val results = runCatching {
                 withContext(Dispatchers.IO) {
                     val videos = BilibiliApi.searchVideos(q)
-                    val bangumi = BilibiliApi.searchBangumi(q)
-                    val media = BilibiliApi.searchMedia(q)
+                    val bangumi = runCatching { BilibiliApi.searchBangumi(q) }
+                        .onFailure { logger.warn("Bilibili bangumi search failed: ${it.message}") }
+                        .getOrDefault(emptyList())
+                    val media = runCatching { BilibiliApi.searchMedia(q) }
+                        .onFailure { logger.warn("Bilibili movie search failed: ${it.message}") }
+                        .getOrDefault(emptyList())
                     val all = videos + bangumi + media
                     logger.debug(
                         "Bilibili search '{}': {} video(s), {} bangumi, {} movie (filter={})",
@@ -223,7 +381,11 @@ class SuggestionsController {
                 logger.warn("Bilibili search failed: ${e.message}")
             }.getOrNull()
 
-            results?.let { publish(seq, it, null, mode = MoreMode.Search(q)) }
+            if (results != null) {
+                publish(seq, results, null, mode = MoreMode.Search(q))
+            } else {
+                publish(seq, null, KEY_ERROR)
+            }
         }
     }
 
@@ -234,6 +396,7 @@ class SuggestionsController {
     /** Switches the Bilibili media-type filter and re-runs the current search when one is active. */
     fun setBilibiliFilter(type: BilibiliSearchType) {
         if (type == bilibiliFilter) return
+        if (searchScope == SearchScope.UPLOADER) return
         logger.debug("Bilibili filter changed: {} -> {}", bilibiliFilter.apiName, type.apiName)
         bilibiliFilter = type
         onResults()
@@ -306,23 +469,34 @@ class SuggestionsController {
             platform = MediaPlatform.BILIBILI,
             bilibiliMediaType = item.mediaType,
             bilibiliAccess = item.accessLabel,
+            bilibiliUnionVideo = item.isUnionVideo,
+            uploaderId = item.uploaderId,
+            publishedText = item.publishedAtEpochSec?.let {
+                java.time.Instant.ofEpochSecond(it).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString()
+            },
+            publishedDaysAgo = item.publishedAtEpochSec?.let {
+                ((System.currentTimeMillis() / 1000L - it) / 86_400L).toInt().coerceAtLeast(0)
+            },
         )
     }
 
     /** Priority bucket for Bilibili ranking. Lower = shown first. */
-    private enum class RankClass { BANGUMI_MOVIE, UPLOADER_MATCH, TITLE_MATCH, OTHER }
+    private enum class RankClass { BANGUMI_MOVIE, UPLOADER_MATCH, TITLE_MATCH, PARTIAL_MATCH, OTHER }
 
     /**
      * Ranks Bilibili results so bangumi/movies surface first, then uploader-name matches, then
      * title matches, then everything else. The [query] is lowercased once for case-insensitive matching.
      */
     private fun bilibiliRank(query: String): Comparator<MediaSearchResult> {
-        val q = query.lowercase()
+        val tokens = query.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }
         return compareBy<MediaSearchResult> { result ->
+            val title = result.title.lowercase()
+            val uploader = result.uploader?.lowercase().orEmpty()
             when {
                 result.bilibiliMediaType == "media_bangumi" || result.bilibiliMediaType == "pgc" -> RankClass.BANGUMI_MOVIE
-                result.uploader?.lowercase()?.contains(q) == true -> RankClass.UPLOADER_MATCH
-                result.title.lowercase().contains(q) -> RankClass.TITLE_MATCH
+                tokens.isNotEmpty() && tokens.all { uploader.contains(it) } -> RankClass.UPLOADER_MATCH
+                tokens.isNotEmpty() && tokens.all { title.contains(it) } -> RankClass.TITLE_MATCH
+                tokens.any { title.contains(it) || uploader.contains(it) } -> RankClass.PARTIAL_MATCH
                 else -> RankClass.OTHER
             }
         }.thenBy { result ->
@@ -461,6 +635,31 @@ class SuggestionsController {
         }
     }
 
+    private fun loadMoreUserPage(query: String, nextPage: Int, sequence: Int) {
+        if (pendingPage < 0) return
+        loadingMore = true
+        launchLoad {
+            val items = runCatching {
+                withContext(Dispatchers.IO) { BilibiliApi.searchUsers(query, nextPage) }
+                    .filter { !AdultContentFilter.isExplicit(it.name, it.signature) }
+                    .map(::uploaderResult)
+            }.onFailure { e ->
+                if (e is CancellationException) throw e
+                logger.warn("Bilibili uploader load-more page $nextPage failed: ${e.message}")
+            }.getOrNull()
+            Minecraft.getInstance().execute {
+                loadingMore = false
+                if (sequence != requestSeq.value || items == null) return@execute
+                if (items.isEmpty()) {
+                    pendingPage = -nextPage
+                    return@execute
+                }
+                pendingPage = nextPage
+                appendCards(items)
+            }
+        }
+    }
+
     /**
      * Appends the next page of results if the current list came from a paginable search / related load,
      * a page isn't already in flight, and the list isn't already exhausted. Bilibili searches page
@@ -471,6 +670,11 @@ class SuggestionsController {
         // The local link list is complete by definition; there is no page two to fetch
         if (sortOption.isOwnList) return
         val mode = moreMode ?: return
+
+        if (mode is MoreMode.UserSearch) {
+            loadMoreUserPage(mode.query, pendingPage + 1, requestSeq.value)
+            return
+        }
 
         if (mode is MoreMode.Search) {
             // Bilibili search: serve more from the already-fetched ranked list first...
@@ -503,8 +707,12 @@ class SuggestionsController {
                 val items = runCatching {
                     withContext(Dispatchers.IO) {
                         val videos = BilibiliApi.searchVideos(query, nextPage)
-                        val bangumi = BilibiliApi.searchBangumi(query, nextPage)
-                        val media = BilibiliApi.searchMedia(query, nextPage)
+                        val bangumi = runCatching { BilibiliApi.searchBangumi(query, nextPage) }
+                            .onFailure { logger.warn("Bilibili bangumi load-more failed: ${it.message}") }
+                            .getOrDefault(emptyList())
+                        val media = runCatching { BilibiliApi.searchMedia(query, nextPage) }
+                            .onFailure { logger.warn("Bilibili movie load-more failed: ${it.message}") }
+                            .getOrDefault(emptyList())
                         (videos + bangumi + media)
                             .filter { bilibiliFilter.matches(it) && !AdultContentFilter.isExplicit(it.title, it.uploader) }
                             .mapNotNull(::bilibiliSearchResult)
@@ -575,7 +783,7 @@ class SuggestionsController {
         moreMode = null
         continuationToken = null
         pendingPage = 1
-        onResults?.invoke()
+        onResults()
     }
 
     /**
@@ -694,6 +902,30 @@ class SuggestionsController {
      */
     private fun pastedResultOrNull(query: String): MediaSearchResult? =
         PastedMediaCards.fromQuery(query)
+
+    /**
+     * Fills in the real name / picture of a pasted Bilibili card in the background: an uploader
+     * space gets its profile name and avatar, a favourites / media list gets its title and cover,
+     * a video gets its metadata. Re-publishes only while this request is still the current one.
+     */
+    private fun enrichPasted(seq: Int, query: String) {
+        launchLoad {
+            val source = MediaSource.from(query) as? MediaSource.Bilibili ?: return@launchLoad
+            val spaceMid = source.spaceMid
+            val mediaListId = source.mediaListId
+            val enriched = when {
+                spaceMid != null -> BilibiliApi.fetchUpProfile(spaceMid)
+                    ?.let { PastedMediaCards.spaceCard(source, it.name, it.face, it.fans, it.videos) }
+
+                mediaListId != null -> BilibiliApi.fetchMediaList(mediaListId, maxPages = 1)
+                    ?.let { PastedMediaCards.mediaListCard(source, it.title, it.items.firstOrNull()?.thumbnailUrl) }
+
+                else -> BilibiliMetadataCache.resolveBlocking(source)
+                    ?.let { PastedMediaCards.bilibiliResult(source, it) }
+            }
+            if (enriched != null && requestSeq.value == seq) publish(seq, listOf(enriched), null)
+        }
+    }
 
     /** Builds a single-card result for a pasted Twitch URL, using [meta] when the Helix lookup succeeded. */
     private fun twitchResult(source: MediaSource.Twitch, meta: TwitchMetadata?): MediaSearchResult {

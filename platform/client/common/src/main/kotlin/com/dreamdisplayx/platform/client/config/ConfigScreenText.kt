@@ -51,6 +51,13 @@ object ConfigScreenText {
         const val AUDIO_ACOUSTICS_TOOLTIP = "dreamdisplayx.config.audio_acoustics.tooltip"
         const val CDN_MIRROR = "dreamdisplayx.config.cdn_mirror"
         const val CDN_MIRROR_TOOLTIP = "dreamdisplayx.config.cdn_mirror.tooltip"
+        const val BILIBILI_COOKIE = "dreamdisplayx.config.bilibili_cookie"
+        const val BILIBILI_COOKIE_TOOLTIP = "dreamdisplayx.config.bilibili_cookie.tooltip"
+        const val BILIBILI_COOKIE_INVALID = "dreamdisplayx.config.bilibili_cookie.invalid"
+        const val DANMAKU_IMPORT = "dreamdisplayx.config.danmaku_import"
+        const val DANMAKU_IMPORT_TOOLTIP = "dreamdisplayx.config.danmaku_import.tooltip"
+        const val DANMAKU_IMPORT_RESULT = "dreamdisplayx.config.danmaku_import.result"
+        const val DANMAKU_IMPORT_ERROR = "dreamdisplayx.config.danmaku_import.error"
     }
 
     /** Uses a declarative entry's English label until a translation or resource-pack override exists. */
@@ -71,6 +78,9 @@ object ConfigScreenText {
     fun decoderLabel(value: String): Component =
         if (value in KNOWN_DECODER_VALUES) translatableText("dreamdisplayx.config.decoder.$value")
         else literalText(value)
+
+    /** Localized component for the Borderless console caret dropdown label. */
+    fun caretLabel(value: String): Component = translatableText("dreamdisplayx.config.console_caret.$value")
 
     /** Localized component for the Bilibili CDN mirror dropdown label. */
     fun cdnLabel(value: String): Component {

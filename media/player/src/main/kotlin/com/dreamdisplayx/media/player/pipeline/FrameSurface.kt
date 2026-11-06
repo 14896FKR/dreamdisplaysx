@@ -71,6 +71,9 @@ internal class FrameSurface(
     private var uploadCount = 0
     private var skippedUploads = 0L
 
+    /** Rate limiter for the size-mismatch warning; a dropped upload must leave a trace in the log. */
+    private var lastSizeDropLogNanos = 0L
+
     /** Returns true once a frame is available for upload or has already been uploaded to the GPU texture. */
     fun textureFilled(): Boolean = textureReady.get() || synchronized(displayQueue) { displayQueue.isNotEmpty() }
 
@@ -100,6 +103,18 @@ internal class FrameSurface(
         val buf = takeDueFrame() ?: return false
         if (actualW != expectedW || actualH != expectedH || !uploader.canUpload()) {
             if (MediaPlayer.DEBUG) skippedUploads++
+            // A size mismatch drops every frame and leaves the screen on the placeholder forever,
+            // so report it once instead of letting the picture stay grey with no clue in the log.
+            val now = System.nanoTime()
+            if (actualW != expectedW || actualH != expectedH) {
+                if (now - lastSizeDropLogNanos >= 5_000_000_000L) {
+                    lastSizeDropLogNanos = now
+                    logger.warn(
+                        "frame upload skipped: frame {}x{} vs texture {}x{} (canUpload={}).",
+                        actualW, actualH, expectedW, expectedH, uploader.canUpload(),
+                    )
+                }
+            }
             recycleFrameBuffer(buf)
             return false
         }
@@ -129,6 +144,16 @@ internal class FrameSurface(
         val buf = takeDueFrame() ?: return false
         if (actualW != expectedW || actualH != expectedH || !uploader.canUpload()) {
             if (MediaPlayer.DEBUG) skippedUploads++
+            val now = System.nanoTime()
+            if (actualW != expectedW || actualH != expectedH) {
+                if (now - lastSizeDropLogNanos >= 5_000_000_000L) {
+                    lastSizeDropLogNanos = now
+                    logger.warn(
+                        "planar upload skipped: frame {}x{} vs texture {}x{} (canUpload={}).",
+                        actualW, actualH, expectedW, expectedH, uploader.canUpload(),
+                    )
+                }
+            }
             recycleFrameBuffer(buf)
             return false
         }

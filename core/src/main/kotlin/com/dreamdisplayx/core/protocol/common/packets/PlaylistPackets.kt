@@ -42,6 +42,15 @@ data class PlaylistItem(
     @ProtoNumber(7) val requesterName: String = "",
 )
 
+/** One entry of an [PlaylistCommandAction.ADD_MANY] command. */
+@DreamDisplaysXUnstableApi
+@Serializable
+data class PlaylistAddItem(
+    @ProtoNumber(1) val url: String = "",
+    @ProtoNumber(2) val title: String = "",
+    @ProtoNumber(3) val lang: String = "",
+)
+
 /** Client playlist mutation/control request. */
 @DreamDisplaysXUnstableApi
 @Serializable
@@ -60,4 +69,6 @@ data class PlaylistCommand(
     @ProtoNumber(11) val expectedPlayRevision: Long = -1L,
     /** Optional stable item identity paired with [expectedPlayRevision]. */
     @ProtoNumber(12) @Serializable(UuidSerializer::class) val expectedItemId: UUID = UUID(0, 0),
+    /** Entries appended by one [com.dreamdisplayx.api.playback.model.PlaylistCommandAction.ADD_MANY]. */
+    @ProtoNumber(13) val items: List<PlaylistAddItem> = emptyList(),
 ) : DreamPacket

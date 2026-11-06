@@ -172,6 +172,7 @@ object LibVlcFrameExtractor {
             // jumps get_time to the target but never advances past it, so awaitPast below would time
             // out on every subsequent hover ("seek did not reach target" + 8s stall). Seeking while
             // PLAYING lets the decoder advance into the target region and render it.
+            runCatching { lib.libvlc_media_player_play(player) }
             runCatching { lib.libvlc_media_player_set_pause(player, 0) }
             grab.clearCaptured()
             // ARM the time gate: without a working timeProvider the display callback's gate collapses
@@ -186,6 +187,9 @@ object LibVlcFrameExtractor {
             // position-jumped frame) and the long-video backward seek regresses. Seek at 1.0x and
             // let awaitPast wait for real decode progress.
             lib.libvlc_media_player_set_time(player, targetMs)
+            // Some libvlc inputs accept set_time while paused but never resume the vout.
+            runCatching { lib.libvlc_media_player_play(player) }
+            runCatching { lib.libvlc_media_player_set_pause(player, 0) }
             // First: confirm the seek landed on (at least) the target.
             if (!awaitPast(player, targetMs, 3_000L)) {
                 logger.warn("ScrubSession: seek did not land on target for $url@$offsetNanos")
@@ -211,12 +215,19 @@ object LibVlcFrameExtractor {
             // point — by then the vout queue has been flushed and the next display is a fresh decode
             // of the new position.
             grab.clearCaptured()
+            runCatching { lib.libvlc_media_player_play(player) }
+            runCatching { lib.libvlc_media_player_set_pause(player, 0) }
             val seekLatch = CountDownLatch(1)
             grab.onFrame = { if (seekLatch.count > 0) seekLatch.countDown() }
             if (!seekLatch.await(2_000L, TimeUnit.MILLISECONDS)) {
                 // Never serve a stale (wrong-position) frame: return null so the cache keeps showing
                 // the nearest valid thumbnail and the next hover retries.
-                logger.warn("ScrubSession: frame timeout for $url@$offsetNanos")
+                val state = runCatching { lib.libvlc_media_player_get_state(player) }.getOrDefault(-1)
+                val timeMs = runCatching { lib.libvlc_media_player_get_time(player) }.getOrDefault(-1L)
+                logger.warn(
+                    "ScrubSession: frame timeout for $url@$offsetNanos (displays={}, format={}x{}, state={}, time={}ms).",
+                    grab.displaysSinceClear, grab.frameW, grab.frameH, state, timeMs,
+                )
                 runCatching { lib.libvlc_media_player_set_pause(player, 1) }
                 grab.acceptAfterMs = -1L
                 grab.timeProvider = null
@@ -444,7 +455,8 @@ object LibVlcFrameExtractor {
 
         @Synchronized
         private fun clearFormat() {
-            formatReady = false
+            // Keep buffers usable: libvlc may skip setup after a same-size seek, and a false
+            // formatReady would then drop every frame while get_time still advances.
         }
 
         fun isActive(): Boolean = active

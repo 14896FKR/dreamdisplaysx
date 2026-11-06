@@ -15,12 +15,14 @@ object ClientShutdownManager {
     /** Stops the application, saves and unloads screens, shuts down coroutines, and interrupts the focuser. */
     fun stop() {
         MediaPlayer.shutdownBackgroundWork()
+        // Save while the players still report their live position. Stopping first made
+        // currentTimeNanos fall back to the last seek origin (often 0) before it was persisted.
+        DisplayRegistry.saveAllScreens()
         // Stop the native players synchronously BEFORE anything else can drop the async teardown: the
         // per-display stop queued by unregister() runs on executors that are shut down further below,
         // and a libvlc audio player left alive kept playing after the world was closed.
         DisplayRegistry.stopAllMediaBlocking()
         DreamServices.registry.getOrNull<ClientApplication>()?.stop()
-        DisplayRegistry.saveAllScreens()
         ClientStartupManager.stop()
         DreamCoroutines.shutdown()
         DisplayRegistry.unloadAll()

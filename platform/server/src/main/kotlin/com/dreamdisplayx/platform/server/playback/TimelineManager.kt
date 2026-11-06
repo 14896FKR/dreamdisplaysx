@@ -131,10 +131,14 @@ object TimelineManager {
         }
     }
 
-    /** Resets the clock to 0 when the video changes (`SYNCED` / `BROADCAST` only). */
+    /** Resets the clock to 0 when the video changes. */
     fun resetVideo(display: DisplayData) {
+        // Every new video starts at the beginning, including LOCAL displays.
+        display.seekPositionNanos = 0L
+        // A new video has a new length: keeping the old one made onDurationReported reject the fresh
+        // report (first report wins) and left a synced timeline looping at the previous length.
+        display.duration = null
         if (display.mode != PlaybackMode.SYNCED && display.mode != PlaybackMode.BROADCAST) return
-        display.duration = null // Fresh video: let onDurationReported accept its own report.
         val fresh = Timeline.start(transport.nowMs(), loop = true)
         timelines[display.id] = fresh
     }

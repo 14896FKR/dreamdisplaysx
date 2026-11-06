@@ -57,6 +57,10 @@ open class HudSuppress {
     @Inject(method = ["renderHotbarAndDecorations"], at = [At("HEAD")], cancellable = true, require = 0)
     open fun extractHotbar(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
 
+    // 1.21.1 renders the XP level number as its own layer, outside renderHotbarAndDecorations.
+    @Inject(method = ["renderExperienceLevel"], at = [At("HEAD")], cancellable = true, require = 0)
+    open fun extractExperienceLevel(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
+
     @Inject(method = ["renderPlayerHealth"], at = [At("HEAD")], cancellable = true, require = 0)
     open fun extractHealth(g: GuiGraphics, ci: CallbackInfo) = suppress(ci)
 
@@ -71,6 +75,20 @@ open class HudSuppress {
 
     @Inject(method = ["renderBossOverlay"], at = [At("HEAD")], cancellable = true, require = 0)
     open fun extractBossOverlay(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
+
+    // Status effects sit in the top-right corner and are the last vanilla HUD layer still visible
+    // behind a Borderless video, which made them flash whenever a screen closed over the overlay.
+    @Inject(method = ["renderEffects"], at = [At("HEAD")], cancellable = true, require = 0)
+    open fun extractEffects(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
+
+    @Inject(method = ["renderOverlayMessage"], at = [At("HEAD")], cancellable = true, require = 0)
+    open fun extractOverlayMessage(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
+
+    @Inject(method = ["renderTitle"], at = [At("HEAD")], cancellable = true, require = 0)
+    open fun extractTitle(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
+
+    @Inject(method = ["renderCameraOverlays"], at = [At("HEAD")], cancellable = true, require = 0)
+    open fun extractCameraOverlays(g: GuiGraphics, dt: DeltaTracker, ci: CallbackInfo) = suppress(ci)
     //?}
     //? if <1.21.1 {
     @Inject(

@@ -10,6 +10,7 @@ import com.dreamdisplayx.api.storage.model.FullDisplayData
 import com.dreamdisplayx.core.protocol.common.packets.DisplayInfo
 import com.dreamdisplayx.core.services.DisplayStorage
 import com.dreamdisplayx.platform.client.core.DreamServices
+import com.dreamdisplayx.media.player.managers.ResumePositionPolicy
 import com.dreamdisplayx.platform.client.displays.DisplayRegistry
 import com.dreamdisplayx.platform.client.displays.DisplayScreen
 import com.dreamdisplayx.platform.client.managers.DisplayLifecycleManager.MAX_DISPLAY_BLOCKS
@@ -123,8 +124,26 @@ object DisplayLifecycleManager {
             depth.coerceAtLeast(1), conforming,
         )
 
-        // A server-persisted seek position overrides the local cache, so a restart resumes rather than replays.
-        if (positionNanos > 0) displayScreen.savedTimeNanos = positionNanos
+        // LOCAL displays prefer the client's last saved position; the server snapshot is often
+        // stale by a report interval. Only use it when the client has no saved time for this URL.
+        val settings = ClientSettingsStore.getSettings(uuid, DisplayScreen.defaultVolume())
+        val localSaved = settings.savedTimeNanos
+        val storedUrl = DisplayStorage.getDisplayData(uuid)?.videoUrl
+        // Same rules the save side uses (headless-tested in ResumePositionPolicy): a LOCAL display
+        // prefers this client's own save, everything else takes the server's copy.
+        displayScreen.savedTimeNanos = ResumePositionPolicy.forRestore(
+            ResumePositionPolicy.RestoreInput(
+                localSavedNanos = if (mode == PlaybackMode.LOCAL) localSaved else 0L,
+                localUrl = settings.savedVideoUrl,
+                serverNanos = positionNanos,
+                serverUrl = storedUrl,
+                currentUrl = code,
+                durationNanos = 0L,
+            ),
+        )
+        if (mode == PlaybackMode.LOCAL && !ClientStateManager.config.autoPlayOnJoin) {
+            displayScreen.paused = true
+        }
 
         displayScreen.createTexture()
         DisplayRegistry.registerScreen(displayScreen)

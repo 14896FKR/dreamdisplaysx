@@ -13,6 +13,7 @@ import net.minecraft.resources.Identifier
 /*import net.minecraft.resources.ResourceLocation as Identifier*/
 import com.dreamdisplayx.api.playback.model.FullscreenMode
 import com.dreamdisplayx.platform.client.Initializer
+import com.dreamdisplayx.platform.client.console.BorderlessConsoleScreen
 import com.dreamdisplayx.platform.client.displays.DisplayScreen
 import com.dreamdisplayx.platform.client.render.AsyncTextureUploader
 import com.dreamdisplayx.platform.client.render.TextureUploadUtil
@@ -21,6 +22,8 @@ import com.dreamdisplayx.platform.client.ui.kit.UiRect
 import com.dreamdisplayx.platform.client.ui.kit.UiTheme
 import com.dreamdisplayx.platform.client.ui.kit.drawOutline
 import com.dreamdisplayx.platform.client.ui.kit.scaleAlpha
+import com.dreamdisplayx.platform.client.ui.drawText
+import com.dreamdisplayx.platform.client.utils.MinecraftScreenUtil
 import com.mojang.blaze3d.platform.NativeImage
 import net.minecraft.client.Minecraft
 //? if >=26 {
@@ -248,7 +251,78 @@ class FullscreenOverlay(
         matrices.popMatrix()
         //?} else
         /*matrices.popPose()*/
+
+        // Watch-mode feedback (volume / seek / part changes) has no screen to draw it, so it is painted
+        // here while this overlay owns the frame. The console screen paints its own line when open;
+        // both call the same plate helper, which tints itself from the picture behind it.
+        val console = BorderlessConsoleScreen
+        if (MinecraftScreenUtil.currentScreen(mc) == null) {
+            val status = console.hudStatus()
+            if (status.isNotEmpty()) {
+                val f = mc.font
+                console.drawBlockPlate(g, 4, sh - 26, 4 + f.width(status) + 8, sh - 12)
+                g.drawText(f, status, 8, sh - 23, UiTheme.TEXT_PRIMARY, true)
+            }
+        }
+        if (console.blockVisible()) sampleBlockTint(sw, sh, vx, vy, vw, vh)
         return true
+    }
+
+    /** [System.nanoTime] of the last plate tint sample; throttled, this runs off the frame buffer. */
+    private var lastTintSampleNanos = 0L
+
+    /**
+     * Averages the picture under the bottom-left plate and hands it to the plate colour. Reads the CPU
+     * frame we already hold for upload (no GPU readback), a 8x8 grid, at most every 250 ms.
+     */
+    private fun sampleBlockTint(sw: Int, sh: Int, vx: Int, vy: Int, vw: Int, vh: Int) {
+        val now = System.nanoTime()
+        if (now - lastTintSampleNanos < TINT_SAMPLE_INTERVAL_NANOS) return
+        lastTintSampleNanos = now
+        val buf = frontBuf
+        val fw = frameW
+        val fh = frameH
+        val format = frameFormat
+        if (fw <= 0 || fh <= 0 || vw <= 0 || vh <= 0 || format.bytesPerPixel < 3) return
+        val stride = fw * format.bytesPerPixel
+        if (buf.remaining() < stride * fh) return
+        // Screen band the plate sits in (bottom-left), clipped to the letterboxed video rect.
+        val x0 = vx.coerceAtLeast(0)
+        val x1 = (vx + vw).coerceAtMost(sw / 2)
+        val y0 = (sh - TINT_BAND_H).coerceAtLeast(vy)
+        val y1 = (sh - 14).coerceAtMost(vy + vh)
+        if (x1 <= x0 || y1 <= y0) {
+            BorderlessConsoleScreen.updateBlockTint(0x101014)
+            return
+        }
+        var sumR = 0L
+        var sumG = 0L
+        var sumB = 0L
+        var count = 0
+        for (gy in 0 until TINT_GRID) {
+            for (gx in 0 until TINT_GRID) {
+                val sx = x0 + (x1 - x0) * gx / TINT_GRID
+                val sy = y0 + (y1 - y0) * gy / TINT_GRID
+                val u = ((sx - vx).toLong() * fw / vw).toInt().coerceIn(0, fw - 1)
+                val v = ((sy - vy).toLong() * fh / vh).toInt().coerceIn(0, fh - 1)
+                val index = v * stride + u * format.bytesPerPixel
+                if (index + 2 >= buf.limit()) continue
+                val c0 = buf.get(index).toInt() and 0xFF
+                val c1 = buf.get(index + 1).toInt() and 0xFF
+                val c2 = buf.get(index + 2).toInt() and 0xFF
+                if (format == UploadPixelFormat.BGRA32) {
+                    sumR += c2; sumG += c1; sumB += c0
+                } else {
+                    sumR += c0; sumG += c1; sumB += c2
+                }
+                count++
+            }
+        }
+        if (count == 0) return
+        val r = (sumR / count).toInt()
+        val g = (sumG / count).toInt()
+        val b = (sumB / count).toInt()
+        BorderlessConsoleScreen.updateBlockTint((r shl 16) or (g shl 8) or b)
     }
 
     /** Crops the padded frame texture down to the actual video content area. */
@@ -296,6 +370,15 @@ class FullscreenOverlay(
 
         /** Scrim opacity behind the video in [FullscreenMode.STANDARD]. */
         private const val SCRIM_ALPHA = 0.72f
+
+        /** Minimum gap between two plate tint samples. */
+        private const val TINT_SAMPLE_INTERVAL_NANOS = 250_000_000L
+
+        /** Height of the screen band used for the plate tint sample. */
+        private const val TINT_BAND_H = 90
+
+        /** Samples per axis of the plate tint grid. */
+        private const val TINT_GRID = 8
     }
 
     private data class ContentRect(val x: Int, val y: Int, val w: Int, val h: Int)

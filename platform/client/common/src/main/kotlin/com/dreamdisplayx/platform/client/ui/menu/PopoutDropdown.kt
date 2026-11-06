@@ -12,13 +12,12 @@ import net.minecraft.client.resources.sounds.SimpleSoundInstance
 import net.minecraft.sounds.SoundEvents
 
 /**
- * The small popup ("Window" / "In-game" / "Fullscreen" / "Borderless") that opens above the popout button.
+ * The small popup ("Window" / "In-game" / "Borderless") that opens above the popout button.
  * Owns its item actions and visibility.
  */
 class PopoutDropdown(
     onWindow: () -> Unit,
     onPip: () -> Unit,
-    onFullscreen: () -> Unit,
     onBorderless: () -> Unit,
 ) {
     var visible: Boolean = false
@@ -27,7 +26,6 @@ class PopoutDropdown(
     private val items: List<Pair<String, () -> Unit>> = listOf(
         "Window" to onWindow,
         "In-game" to onPip,
-        "Fullscreen" to onFullscreen,
         "Borderless" to onBorderless,
     )
 

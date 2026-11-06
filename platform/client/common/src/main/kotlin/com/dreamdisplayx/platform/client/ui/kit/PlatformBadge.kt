@@ -30,6 +30,9 @@ object PlatformBadge {
     /** Yellow "paid" badge for Bilibili results that must be bought per-view. */
     private val PAID = Badge("dreamdisplayx.ui.bilibili_paid", UiTheme.ACCENT_BILIBILI_PAID, DARK_TEXT)
 
+    /** Pink co-authorship badge for Bilibili collaboration videos. */
+    private val UNION = Badge("dreamdisplayx.ui.bilibili_union", UiTheme.ACCENT_BILIBILI_VIP, UiTheme.TEXT_PRIMARY)
+
     /** The badge for [platform], or null when it needs none (a plain YouTube / long-tail result). */
     fun forPlatform(platform: MediaPlatform): Badge? = when (platform) {
         MediaPlatform.TWITCH -> TWITCH
@@ -52,6 +55,10 @@ object PlatformBadge {
         info.platform == MediaPlatform.BILIBILI -> bilibiliAccessBadge(info.bilibiliAccess)
         else -> forPlatform(info.platform)
     }
+
+    /** The co-authorship badge for a Bilibili result, or null for every other card. */
+    fun unionBadge(info: MediaSearchResult): Badge? =
+        if (info.platform == MediaPlatform.BILIBILI && info.bilibiliUnionVideo) UNION else null
 
     /**
      * Maps a Bilibili access marker to a badge: "vip" → pink plate, "paid" → yellow plate, anything

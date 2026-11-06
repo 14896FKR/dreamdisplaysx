@@ -21,24 +21,23 @@ import com.dreamdisplayx.api.playback.model.DisplayAccess
 import com.dreamdisplayx.api.playback.model.FullscreenMode
 import com.dreamdisplayx.api.playback.model.PlaybackAction
 import com.dreamdisplayx.api.playback.model.PlaybackMode
-import com.dreamdisplayx.api.playback.model.PlaylistCommandAction
 import com.dreamdisplayx.api.playback.service.keys.PlaybackServices
 import com.dreamdisplayx.api.runtime.registry.service.get
 import com.dreamdisplayx.api.watchparty.service.keys.WatchPartyServices
+import com.dreamdisplayx.media.source.bilibili.BilibiliUserItem
 import com.dreamdisplayx.platform.client.core.DreamServices
 import com.dreamdisplayx.platform.client.displays.DisplayRegistry
 import com.dreamdisplayx.platform.client.input.MouseButtons
 import com.dreamdisplayx.platform.client.displays.DisplayScreen
 import com.dreamdisplayx.platform.client.managers.ClientStateManager
-import com.dreamdisplayx.platform.client.managers.PlaylistStateStore
 import com.dreamdisplayx.platform.client.popout.PopoutManager
 import com.dreamdisplayx.platform.client.render.ScrubPreview
 import com.dreamdisplayx.platform.client.storage.ClientSettingsStore
-import com.dreamdisplayx.platform.client.storage.CustomVideoStore
 import com.dreamdisplayx.platform.client.ui.kit.UiRect
 import com.dreamdisplayx.platform.client.ui.kit.UiScreenBase
 import com.dreamdisplayx.platform.client.ui.kit.UiText
 import com.dreamdisplayx.platform.client.ui.kit.UiTheme
+import com.dreamdisplayx.platform.client.ui.kit.UiWidget
 import com.dreamdisplayx.platform.client.ui.kit.drawPanel
 import com.dreamdisplayx.platform.client.ui.kit.drawPanelSprite
 import com.dreamdisplayx.platform.client.ui.menu.*
@@ -72,7 +71,6 @@ class DisplayMenu private constructor(
     private val dropdown = PopoutDropdown(
         onWindow = { popout.openWindow(DisplayId(displayScreen.uuid)) },
         onPip = { popout.openPip(DisplayId(displayScreen.uuid)) },
-        onFullscreen = { popout.openFullscreen(DisplayId(displayScreen.uuid), FullscreenMode.STANDARD); onClose() },
         onBorderless = { popout.openFullscreen(DisplayId(displayScreen.uuid), FullscreenMode.IMMERSIVE); onClose() },
     )
     private val audioTrackDropdown = AudioTrackDropdown(
@@ -130,6 +128,9 @@ class DisplayMenu private constructor(
 
     /** Which sub-panel the settings column shows: `false` = display settings, `true` = playlist. */
     private var showPlaylistTab = false
+
+    /** Widgets the error panel places itself; everything else is hidden while it is up. */
+    private val errorPanelWidgets = mutableListOf<UiWidget>()
 
     private var prevQualityListSize = 0
     private var suggestionsRect: UiRect? = null
@@ -288,10 +289,10 @@ class DisplayMenu private constructor(
         danmakuDensityReset.visibleWhen = notErrored
 
         danmakuScale = addUi(ValueSlider(
-            initial = (cfg.danmakuScalePercent - 50) / 120.0,
-            label = { literalText("${(50 + it * 120).roundToInt()}%") },
-            step = 1.0 / 120.0,
-        ) { value -> cfg.danmakuScalePercent = (50 + value * 120).roundToInt(); cfg.save() })
+            initial = (cfg.danmakuScalePercent - 25) / 145.0,
+            label = { Component.literal("${(25 + it * 145).roundToInt()}%") },
+            step = 1.0 / 145.0,
+        ) { value -> cfg.danmakuScalePercent = (25 + value * 145).roundToInt(); cfg.save() })
         danmakuScale.visibleWhen = notErrored
 
         val danmakuScaleReset = addUi(IconButton("refresh") { cfg.danmakuScalePercent = 100; cfg.save() })
@@ -430,8 +431,18 @@ class DisplayMenu private constructor(
         val retryButton = addUi(IconButton("refresh") {
             playback.retry(displayId) // Local re-resolve; the error panel clears itself once it succeeds
         })
-        // Only the error panel places it; keep it hidden in the normal menu so it never strays to (0,0)
-        retryButton.visibleWhen = { ds.errored }
+        // Only the error panel places it, so it stays hidden in the normal menu and is not drawn at a
+        // stale position after the panel is dismissed; an offline live room has nothing to retry.
+        retryButton.visibleWhen = { ds.errored && ds.dismissedMediaError !== ds.mediaError && !ds.errorIsLiveOffline }
+
+        // Error panel slot: close the prompt, and empty the display so it returns to the idle
+        // placeholder instead of sitting on a failed video (a viewer without permission only
+        // dismisses it locally). It used to be the delete-display button.
+        val errorCloseButton = addUi(IconButton("cross") {
+            ds.dismissedMediaError = ds.mediaError
+            ds.clearVideo()
+        })
+        errorCloseButton.visibleWhen = { ds.errored && ds.dismissedMediaError !== ds.mediaError }
 
         val deleteButton = addUi(
             IconButton(
@@ -454,8 +465,9 @@ class DisplayMenu private constructor(
                 })
         } else null
 
-        suggestions = addUi(SuggestionsPanel(::onPickSuggested, ds.suggestionsController))
-        suggestions.visibleWhen = { !ds.errored && suggestionsRect != null }
+        suggestions = addUi(SuggestionsPanel(::onPickSuggested, ds.suggestionsController, ::onOpenUploader))
+        ds.suggestionsController.onDirectBilibiliPick = ::onPickSuggested
+        suggestions.visibleWhen = { suggestionsRect != null }
         // Locked / Broadcast / Watch party displays only let the owner / admin change the video, so
         // the panel shows an "unavailable" notice to everyone else instead of pickable suggestions.
         suggestions.available = { ds.canSetVideoHere }
@@ -480,6 +492,7 @@ class DisplayMenu private constructor(
             PreviewSection(
                 ds, muteButton, volume, popoutButton, audioTrackButton, subtitleButton, subtitleSecondaryButton, danmakuButton, pauseButton, progress,
                 dropdown, audioTrackDropdown, subtitleDropdown, subtitleSecondaryDropdown,
+                onOpenUploader = { BilibiliUploaderScreen.open(displayScreen, it, "", returnToPlaylist = showPlaylistTab) },
             )
         settings = SettingsSection(
             rows = settingsRows(
@@ -503,7 +516,8 @@ class DisplayMenu private constructor(
                 danmakuButton to { buttonTooltip("dreamdisplayx.button.danmaku") },
             ),
         )
-        errorPanel = ErrorPanel(retryButton, deleteButton, reportButton) { ds.mediaError }
+        errorPanelWidgets += listOfNotNull(retryButton, errorCloseButton, reportButton)
+        errorPanel = ErrorPanel(retryButton, errorCloseButton, reportButton) { ds.mediaError }
     }
 
     /** Builds the settings rows with their tooltip content. */
@@ -655,31 +669,27 @@ class DisplayMenu private constructor(
         tooltipBody("$prefix.tooltip.2"),
     )
 
-    /** Requests [info] as the display video and reloads the related list once the intent is sent. */
+    /** Requests [info] as the display video. */
     private fun onPickSuggested(info: MediaSearchResult) {
-        val ds = displayScreen
-        if (!ds.canSetVideoHere) return
-        val url = info.getWatchUrl()
+        SuggestedVideoActions.pick(displayScreen, info)
+    }
 
-        // Playlist mode: only enqueue while the queue is explicitly enabled AND idle — the server
-        // auto-starts the first non-pending item of an idle queue, so a pick still plays right away.
-        // In every other state (playlist never seen, or the queue already playing) the user wants
-        // "play this now": fall through to the direct set-video path so the click always plays.
-        val playlist = PlaylistStateStore.stateOf(ds.uuid)
-        if (playlist?.enabled == true && playlist.currentIndex < 0) {
-            PlaylistStateStore.send(ds.uuid, PlaylistCommandAction.ADD.wire, url = url, title = info.title)
-            if (info.isCustom) {
-                CustomVideoStore.remember(url, info.title)
-            }
-            return
-        }
-
-        DreamServices.registry.get(DisplayServices.DISPLAY).setUrl(DisplayId(ds.uuid), url, ds.lang)
-
-        // A pasted link exists nowhere else, so remember it locally the moment it is used
-        if (info.isCustom) {
-            CustomVideoStore.remember(url, info.title)
-        }
+    /** Opens the full-window uploader page for an UP search result. */
+    private fun onOpenUploader(info: MediaSearchResult) {
+        val mid = info.uploaderId ?: return
+        val user = BilibiliUserItem(
+            mid = mid,
+            name = info.title,
+            avatarUrl = info.channelAvatarUrl,
+            signature = info.uploader,
+            fans = info.uploaderFans,
+            videoCount = info.uploaderVideoCount,
+            verified = info.isVerified,
+        )
+        BilibiliUploaderScreen.open(
+            displayScreen, user, displayScreen.suggestionsController.uploaderKeywordForPick,
+            returnToPlaylist = showPlaylistTab,
+        )
     }
 
     override fun drawScreen(g: GuiGraphicsCompat, mouseX: Int, mouseY: Int, partialTick: Float) {
@@ -692,9 +702,15 @@ class DisplayMenu private constructor(
         resyncModeSlider()
         audio3d.syncToCurrent()
 
-        if (ds.errored) {
+        // The panel only blocks the menu until the viewer closes it: dismissing it keeps the display
+        // state as it is but hands the menu back, so a failed video can be replaced from the search box.
+        if (ds.errored && ds.dismissedMediaError !== ds.mediaError) {
             dropdown.hide()
             suggestionsRect = null
+            if (::preview.isInitialized) preview.clearHitTargets()
+            // No layout pass runs in this branch, so every other control would be painted where it
+            // was last placed (or at the origin). The panel owns the screen: leave it alone.
+            hideWidgetsExcept(errorPanelWidgets)
             errorPanel.render(g, width, height)
             drawChildren(g, mouseX, mouseY, partialTick)
             return
@@ -718,7 +734,7 @@ class DisplayMenu private constructor(
         if (showPlaylistTab) {
             playlist.render(g, settingsContent, mouseX, mouseY)
         } else {
-            settings.render(g, settingsContent, mouseX, mouseY)
+            settings.render(g, settingsContent, mouseX, mouseY, uiScale)
         }
 
         val suggestionsArea = layout.suggestions
@@ -772,7 +788,7 @@ class DisplayMenu private constructor(
     override fun onMouseScrolled(mouseX: Double, mouseY: Double, scrollX: Double, scrollY: Double): Boolean {
         if (replayReadOnly) return true
         return if (showPlaylistTab) {
-            playlist.handleScroll(mouseY.toInt(), scrollY)
+            playlist.handleScroll(mouseX.toInt(), mouseY.toInt(), scrollY)
         } else {
             settings.handleScroll(mouseX.toInt(), mouseY.toInt(), scrollY)
         } || audioTrackDropdown.handleScroll(mouseX.toInt(), mouseY.toInt(), scrollY) ||
@@ -787,6 +803,7 @@ class DisplayMenu private constructor(
         g.drawPanelSprite(panel)
         val f = font
         val tabH = f.lineHeight + 6
+        rememberTab(showPlaylistTab)
         val tabW = max(110, panel.w / 2)
         val playlistTab = UiRect(panel.x, panel.y, tabW, tabH)
         val settingsTab = UiRect(panel.x + tabW, panel.y, panel.w - tabW, tabH)
@@ -808,6 +825,9 @@ class DisplayMenu private constructor(
         // before drawScreen runs, so re-assert the tab-driven visibility here, right before
         // drawChildren paints them: only the active panel's controls are visible / clickable.
         playlist.children.forEach { it.visible = showPlaylistTab }
+        // A text box that still holds focus while its tab is hidden kept the screen in "typing"
+        // mode, which swallowed every menu hotkey (F included).
+        if (!showPlaylistTab) playlist.releaseFocus()
         settings.setControlsVisible(!showPlaylistTab)
     }
 
@@ -817,8 +837,9 @@ class DisplayMenu private constructor(
     /** Handles a click on the two-tab header; returns true when consumed. */
     private fun handleTabClick(mx: Int, my: Int): Boolean {
         if (tabPlaylistRect?.contains(mx, my) == true) {
+            // Do not grab the URL box here: a focused text box counts as "typing", which swallowed
+            // every menu hotkey (F included) until the player clicked somewhere else.
             showPlaylistTab = true
-            playlist.focusInput()
             return true
         }
         if (tabSettingsRect?.contains(mx, my) == true) {
@@ -833,6 +854,9 @@ class DisplayMenu private constructor(
         if (replayReadOnly) return true
         val mx = event.x().toInt()
         val my = event.y().toInt()
+        if (MouseButtons.isLeft(event.button()) && ::preview.isInitialized &&
+            (preview.handleUploaderClick(event.x(), event.y()) || preview.handlePartClick(event.x(), event.y()))
+        ) return true
         if (MouseButtons.isLeft(event.button()) && handleTabClick(mx, my)) return true
         if (MouseButtons.isLeft(event.button()) && !showPlaylistTab && settings.handleScrollbarPress(mx, my)) return true
         if (MouseButtons.isLeft(event.button()) && showPlaylistTab && playlist.handleClick(mx, my)) return true
@@ -879,6 +903,9 @@ class DisplayMenu private constructor(
         if (replayReadOnly) return true
         val mx = mouseX.toInt()
         val my = mouseY.toInt()
+        if (MouseButtons.isLeft(button) && ::preview.isInitialized &&
+            (preview.handleUploaderClick(mouseX, mouseY) || preview.handlePartClick(mouseX, mouseY))
+        ) return true
         if (MouseButtons.isLeft(button) && handleTabClick(mx, my)) return true
         if (MouseButtons.isLeft(button) && !showPlaylistTab && settings.handleScrollbarPress(mx, my)) return true
         if (MouseButtons.isLeft(button) && showPlaylistTab && playlist.handleClick(mx, my)) return true
@@ -968,8 +995,18 @@ class DisplayMenu private constructor(
             }
             KEY_LEFT -> if (canSeek) seekTo(ds.currentTimeNanos - seekStep) else return false
             KEY_RIGHT -> if (canSeek) seekTo(ds.currentTimeNanos + seekStep) else return false
-            KEY_UP -> if (videoReady) nudgeVolume(volumeStep) else return false
-            KEY_DOWN -> if (videoReady) nudgeVolume(-volumeStep) else return false
+            // While the part picker is open the arrows step through its parts; volume keeps the keys
+            // only when it is closed, so a multi-part video can be browsed without leaving the menu.
+            KEY_UP -> {
+                if (preview.stepPart(-1)) return true
+                if (!videoReady) return false
+                nudgeVolume(volumeStep)
+            }
+            KEY_DOWN -> {
+                if (preview.stepPart(1)) return true
+                if (!videoReady) return false
+                nudgeVolume(-volumeStep)
+            }
             KEY_M -> if (videoReady) playback.mute(displayId, !ds.muted) else return false
             in DIGIT_KEYS, in NUMPAD_DIGIT_KEYS -> {
                 if (!canSeek) return false
@@ -978,8 +1015,15 @@ class DisplayMenu private constructor(
             }
             KEY_F -> {
                 if (!videoReady || !ds.canPopoutHere) return false
-                popout.openFullscreen(displayId, FullscreenMode.STANDARD)
+                popout.openFullscreen(displayId, FullscreenMode.IMMERSIVE)
                 onClose()
+            }
+            KEY_V -> {
+                // V over the uploader part of a playlist row opens that creator's page (see PlaylistPanel).
+                if (!showPlaylistTab || !::playlist.isInitialized) return false
+                val user = playlist.uploaderUnderCursor() ?: return false
+                BilibiliUploaderScreen.open(displayScreen, user, "", returnToPlaylist = showPlaylistTab)
+                return true
             }
             KEY_P -> {
                 if (!videoReady) return false
@@ -1050,6 +1094,9 @@ class DisplayMenu private constructor(
 
         private const val KEY_SPACE = InputConstants.KEY_SPACE
         private const val KEY_F = InputConstants.KEY_F
+
+        /** Opens the creator page of the playlist row whose uploader the cursor is over. */
+        private const val KEY_V = InputConstants.KEY_V
         private const val KEY_M = InputConstants.KEY_M
         private const val KEY_P = InputConstants.KEY_P
         private const val KEY_RIGHT = InputConstants.KEY_RIGHT
@@ -1145,12 +1192,32 @@ class DisplayMenu private constructor(
             StretchMode.CROP -> "dreamdisplayx.mode.crop"
         }
 
-        /** Opens the menu for [displayScreen]. */
-        fun open(displayScreen: DisplayScreen) {
+        /** Opens the menu for [displayScreen], or for its playlist tab when [playlistTab] is set. */
+        fun open(displayScreen: DisplayScreen, playlistTab: Boolean = false) {
             if (!com.dreamdisplayx.platform.client.render.ReplayModCompat.isReplayActive) {
                 com.dreamdisplayx.platform.client.render.ReplayModCompat.recordAction("open", displayScreen.uuid)
             }
-            MinecraftScreenUtil.setScreen(Minecraft.getInstance(), DisplayMenu(displayScreen))
+            val menu = DisplayMenu(displayScreen)
+            menu.showPlaylistTab = playlistTab
+            MinecraftScreenUtil.setScreen(Minecraft.getInstance(), menu)
+        }
+
+        /** Opens the menu on the playlist tab, e.g. after importing a pasted favourites list. */
+        fun openWithPlaylistTab(displayScreen: DisplayScreen) {
+            open(displayScreen, playlistTab = true)
+        }
+
+        /**
+         * The tab the player was last looking at. Pages opened from the menu (creator page, pasted
+         * cards) hand this back to [open] so going back lands where they came from instead of
+         * always dropping them on the display-settings tab.
+         */
+        internal var lastPlaylistTab: Boolean = false
+            private set
+
+        /** Records the visible tab; called every frame from the tab strip. */
+        private fun rememberTab(playlistTab: Boolean) {
+            lastPlaylistTab = playlistTab
         }
     }
 }

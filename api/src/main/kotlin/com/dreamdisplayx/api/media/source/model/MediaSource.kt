@@ -58,6 +58,10 @@ sealed interface MediaSource {
         val roomId: Long? = null,
         val epId: Long? = null,
         val seasonId: Long? = null,
+        /** Favourites / media list id: `medialist/detail/ml<id>` and `favlist?fid=<id>`. */
+        val mediaListId: Long? = null,
+        /** Uploader space id from `space.bilibili.com/<mid>`; opens the creator page, never playback. */
+        val spaceMid: Long? = null,
     ) : MediaSource
 
     /** Direct playable stream URL or manifest; [kind] records what [com.dreamdisplayx.api.media.source.url.CustomMediaUrls] recognized. */

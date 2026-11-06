@@ -51,3 +51,14 @@ platform/server/logs/
 
 # Stonecutter
 versions/
+
+# Local rollback artifacts / python cache
+backups/
+__pycache__/
+
+# Local-only working docs (agent handoff / notes, never pushed)
+HANDOFF.md
+TECHNICAL-NOTES.md
+PLAYBACK-STATE-MACHINE.md
+NOTES-local.md
+archive/

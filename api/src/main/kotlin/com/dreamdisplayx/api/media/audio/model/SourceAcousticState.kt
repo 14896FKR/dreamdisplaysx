@@ -21,6 +21,13 @@ data class SourceAcousticState(
     /** True while played through a popout / fullscreen window, where distance no longer applies. */
     val bypassSpatial: Boolean,
 
+    /**
+     * True while the borderless overlay fills the viewport: the DSP still spatialises the source, but the
+     * wall's distance must not attenuate or muffle it, because the player is looking at the picture as if
+     * they stood at the screen.
+     */
+    val flatDistance: Boolean = false,
+
     /** Higher-priority sources keep the full DSP chain first when the render budget is exceeded. */
     val priority: Int = 0,
 

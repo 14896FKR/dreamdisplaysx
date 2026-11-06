@@ -28,6 +28,9 @@ interface PlaybackHost {
     /** True while the viewer has the display paused. */
     val isPaused: Boolean
 
+    /** True once the host has uploaded at least one decoded frame to its GPU texture. */
+    val hasRenderedFrame: Boolean get() = false
+
     /** Effective playback mode (Watch Party overrides the display's own mode). */
     val effectiveMode: PlaybackMode
 

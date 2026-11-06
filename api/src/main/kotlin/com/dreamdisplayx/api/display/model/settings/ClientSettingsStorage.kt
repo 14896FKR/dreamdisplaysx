@@ -48,7 +48,7 @@ interface ClientSettingsStorage {
     fun setSubtitleSecondaryLang(displayUuid: UUID, lang: String?)
 
     /** Sets the last known playback position for [displayUuid] and saves. */
-    fun setSavedTimeNanos(displayUuid: UUID, nanos: Long)
+    fun setSavedTimeNanos(displayUuid: UUID, nanos: Long, videoUrl: String? = null)
 
     /** Sets whether [displayUuid] is pinned to a Picture-in-Picture overlay and saves. */
     fun setPipOpen(displayUuid: UUID, open: Boolean)

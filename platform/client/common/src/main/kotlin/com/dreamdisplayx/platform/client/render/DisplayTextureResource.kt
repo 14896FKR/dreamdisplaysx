@@ -155,6 +155,16 @@ class DisplayTextureResource(private val uuid: UUID) {
     private fun Int.toEvenDimension(): Int = (this and 1.inv()).coerceAtLeast(2)
 
     /**
+     * True when the live allocation already has the pixel size these arguments would produce, so
+     * reallocating would only throw away the frame it currently holds.
+     */
+    fun hasSameSize(blockWidth: Int, blockHeight: Int, qualityHeight: Int, contentAspect: Double = 0.0): Boolean {
+        if (current == null) return false
+        val (w, h) = textureDimensions(blockWidth, blockHeight, qualityHeight, contentAspect)
+        return w == width && h == height
+    }
+
+    /**
      * Releases any existing textures (current and pending) and allocates fresh GPU textures and a
      * [RenderType] sized for [blockWidth] x [blockHeight] blocks at [qualityHeight] pixels. Must be
      * called on the render thread.

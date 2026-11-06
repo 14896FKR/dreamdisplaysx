@@ -17,16 +17,19 @@ import net.minecraft.resources.Identifier
 /*import net.minecraft.client.renderer.RenderType
 import net.minecraft.resources.ResourceLocation as Identifier*/
 import java.util.WeakHashMap
+import org.slf4j.LoggerFactory
 
 /** Optional branded placeholder. Static textures and batched quads work without AWT on Android. */
 internal object LoadingScreenRenderer {
     private typealias Draw = (RenderType, (PoseStack.Pose, VertexConsumer) -> Unit) -> Unit
+    private val logger = LoggerFactory.getLogger("DreamDisplaysX/LoadingScreen")
 
     private class State {
         val clock = LoadingScreenClock()
         var source: List<ConformQuad>? = null
         var rotation = -1
         var physical: List<ConformQuad> = emptyList()
+        var lastDiagNanos = 0L
     }
 
     // Weak keys also release off-screen/deleted displays without introducing a new lifecycle owner.
@@ -42,13 +45,28 @@ internal object LoadingScreenRenderer {
     /** Called before the flat/curved split; the real first frame always wins over the intro. */
     fun frame(screen: DisplayScreen, replay: Boolean): LoadingScreenAnimation.Frame? {
         val enabled = ClientStateManager.config.animatedLoadingScreen
-        val ready = screen.isVideoStarted && screen.hasTexture && screen.renderType != null
+        // A buffering spell keeps the last picture on screen, so it no longer counts as "loading":
+        // covering it with the animated intro is what produced the grey placeholder flash.
+        val ready = screen.hasPictureToShow
         if (!enabled || ready || screen.errored) {
             states.remove(screen)
             return null
         }
         val state = states.getOrPut(screen) { State() }
-        val elapsed = state.clock.elapsed(enabled, ready, screen.errored, screen.mediaGeneration, System.nanoTime(), replay) ?: return null
+        val now = System.nanoTime()
+        val elapsed = state.clock.elapsed(enabled, ready, screen.errored, screen.mediaGeneration, now, replay) ?: return null
+        if (elapsed >= 2_000_000_000L && now - state.lastDiagNanos >= 2_000_000_000L) {
+            state.lastDiagNanos = now
+            logger.info(
+                "Loading screen still active: started={} hasTexture={} renderType={} waitingTimeline={} errored={} gen={}.",
+                screen.isVideoStarted,
+                screen.hasTexture,
+                screen.renderType != null,
+                screen.isWaitingForInitialTimeline,
+                screen.errored,
+                screen.mediaGeneration,
+            )
+        }
         return LoadingScreenAnimation.frame(elapsed, screen.width, screen.height)
     }
 

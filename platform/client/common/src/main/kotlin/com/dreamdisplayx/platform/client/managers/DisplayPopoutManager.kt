@@ -47,6 +47,12 @@ class DisplayPopoutManager(
     /** True while the fullscreen overlay is active. */
     val isFullscreenActive: Boolean get() = fullscreenOverlay != null
 
+    /** True while the borderless overlay covers the viewport; a forced broadcast overlay does not count. */
+    val isBorderlessActive: Boolean
+        get() = fullscreenOverlay?.let {
+            it.mode == com.dreamdisplayx.api.playback.model.FullscreenMode.IMMERSIVE && !it.forced
+        } == true
+
     /** Re-attaches all active popout frame sinks to [player] after a player swap. */
     fun attachTo(player: MediaPlayer, contentAspect: () -> Double) {
         currentPlayer = player
@@ -158,6 +164,8 @@ class DisplayPopoutManager(
         closeFullscreenOverlay()
         fullscreenOverlay = FullscreenOverlayManager.open(displayScreen, mode, forced, sessionId)
         rewireSink()
+        // Opening on a paused session has the same empty-overlay problem as closing: seed one frame.
+        player.takeIf { displayScreen.isPaused }?.let { seedFromSnapshot(it) }
         emit(PopoutEvent.Opened(displayScreen.uuid.toString()))
     }
 
@@ -167,6 +175,19 @@ class DisplayPopoutManager(
         if (fullscreenOverlay == null) return
         closeFullscreenOverlay()
         rewireSink()
+        // A paused session emits no frames, so re-queue the kept still into the wall's surface.
+        currentPlayer?.takeIf { displayScreen.isPaused }?.pushStillFrame()
+    }
+
+    /** Seeds the active fullscreen overlay with the player's newest still, if it kept one. */
+    private fun seedFromSnapshot(player: MediaPlayer) {
+        val overlay = fullscreenOverlay ?: return
+        val frame = player.lastFrameSnapshot() ?: run {
+            logger.info("{} no still frame to seed the overlay with.", displayScreen.uuid)
+            return
+        }
+        overlay.updateFrame(frame.buffer, frame.width, frame.height, contentAspect(), FramePixelFormat.BGRA32.toUploadFormat())
+        logger.info("{} overlay seeded from still frame {}x{}.", displayScreen.uuid, frame.width, frame.height)
     }
 
     /** Swaps the active fullscreen overlay for a PiP overlay in one step, at double the normal PiP size. */

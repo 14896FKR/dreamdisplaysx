@@ -40,8 +40,8 @@ object ScrubPreview {
     private val logger = LoggerFactory.getLogger("DreamDisplaysX/ScrubPreview")
 
     /** Fixed frame dimensions every extracted frame is encoded to (used by the Vanilla blit rendering). */
-    const val FRAME_WIDTH = 256
-    const val FRAME_HEIGHT = 144
+    const val FRAME_WIDTH = 640
+    const val FRAME_HEIGHT = 360
 
     /**
      * A cached frame is considered a hit when its timestamp is within this distance of the hover

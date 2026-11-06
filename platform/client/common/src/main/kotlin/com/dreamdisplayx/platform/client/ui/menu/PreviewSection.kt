@@ -11,13 +11,19 @@ import net.minecraft.resources.Identifier
 /*import net.minecraft.resources.ResourceLocation as Identifier*/
 import com.dreamdisplayx.api.media.source.url.CustomMediaUrls
 import com.dreamdisplayx.api.media.source.model.MediaPlatform
+import com.dreamdisplayx.api.display.model.property.DisplayId
+import com.dreamdisplayx.api.display.service.keys.DisplayServices
 import com.dreamdisplayx.api.media.source.model.MediaSource
+import com.dreamdisplayx.api.runtime.registry.service.get
+import com.dreamdisplayx.platform.client.core.DreamServices
 import com.dreamdisplayx.media.source.bilibili.BilibiliMetadataCache
+import com.dreamdisplayx.media.source.bilibili.BilibiliUserItem
 import com.dreamdisplayx.media.source.kick.KickMetadataCache
 import com.dreamdisplayx.media.source.platform.PlatformVideoMetadata
 import com.dreamdisplayx.media.source.twitch.TwitchMetadataCache
 import com.dreamdisplayx.media.source.vimeo.VimeoMetadataCache
 import com.dreamdisplayx.platform.client.Initializer
+import com.dreamdisplayx.platform.client.console.PlaybackClock
 import com.dreamdisplayx.platform.client.displays.DisplayScreen
 import com.dreamdisplayx.platform.client.render.*
 import com.dreamdisplayx.platform.client.ui.GuiGraphicsCompat
@@ -34,6 +40,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.*
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -56,6 +63,8 @@ class PreviewSection(
     private val audioTrackDropdown: AudioTrackDropdown,
     private val subtitleDropdown: SubtitleDropdown,
     private val subtitleSecondaryDropdown: SubtitleDropdown,
+    /** Opens the uploader page for the video's creator; null leaves the uploader chip inert. */
+    private val onOpenUploader: ((BilibiliUserItem) -> Unit)? = null,
 ) {
     // Owned by DisplayScreen (not this section) so the last decoded frame — and its GPU texture —
     // survive closing and reopening the menu instead of needing a fresh push before showing anything.
@@ -63,6 +72,12 @@ class PreviewSection(
     private val ambientSampler = AmbientFrameSampler(ds)
     private var frameSinkAttached = false
     private var lastVideoUrl: String? = null
+
+    /** Screen-space rect of the uploader chip (avatar + name), recorded while drawing. */
+    private var uploaderHitRect: UiRect? = null
+
+    /** Creator behind [uploaderHitRect]; null when the current source has no creator page. */
+    private var uploaderHitUser: BilibiliUserItem? = null
 
     // Starts at the CURRENT state rather than always 0 — otherwise every menu reopen replays the
     // grow-in animation even when the track count was already known and settled from a previous
@@ -74,6 +89,20 @@ class PreviewSection(
 
     companion object {
         private val logger = org.slf4j.LoggerFactory.getLogger("DreamDisplaysX/PreviewSection")
+
+        /** Chip sentinels: toggling the part list, and paging it, rather than a part number. */
+        private const val PART_LIST_TOGGLE = -2
+        private const val PART_PAGE_BACK = -1
+        private const val PART_PAGE_FORWARD = 0
+
+        /** Rows the part list shows at once before it pages. */
+        private const val PART_LIST_ROWS = 8
+
+        /** Widest the part list popup may get, so long titles do not stretch it across the menu. */
+        private const val PART_LIST_MAX_W = 236
+
+        /** Hover wash for picker rows; heavier than the theme-wide one so it reads on the dark popup. */
+        private const val PART_HOVER_FILL = 0x50FFFFFF
 
         /** Enables the FPS debug label on the preview video (top-left) via -Ddreamdisplayx.debugFps=true. */
         private val DEBUG_FPS: Boolean =
@@ -89,10 +118,15 @@ class PreviewSection(
     /** Draws the panel content into [panel] and lays out the controls row along its bottom edge. */
     fun render(g: GuiGraphicsCompat, panel: UiRect, mouseX: Int, mouseY: Int) {
         val font = Minecraft.getInstance().font
+        uploaderHitRect = null
+        uploaderHitUser = null
+        lastMouseX = mouseX
+        lastMouseY = mouseY
         val btn = UiTheme.CONTROL_BUTTON
         val innerX = panel.x + UiTheme.PANEL_PADDING_X
         val innerY = panel.y + UiTheme.PANEL_PADDING_Y + font.lineHeight + 6
         val innerW = panel.w - UiTheme.PANEL_PADDING_X * 2
+        partListVideoTop = innerY
 
         val controlsRowY = panel.bottom - UiTheme.PANEL_PADDING_Y - btn
         val controlsRight = innerX + innerW
@@ -158,6 +192,8 @@ class PreviewSection(
         if (subtitleSecondaryPresence > 0.01f) subtitleSecondaryDropdown.draw(g, secondaryBtnFinalCenterX, controlsRowY, mouseX, mouseY)
         val subtitleBtnFinalCenterX = subtitleSlotRight - btn / 2
         if (subtitlePresence > 0.01f) subtitleDropdown.draw(g, subtitleBtnFinalCenterX, controlsRowY, mouseX, mouseY)
+        // Drawn last: the part picker covers the video area, never the card's own title / meta lines.
+        if (partListOpen) drawPartList(g, font, mouseX, mouseY)
     }
 
     /** Draws the letterboxed video frame, or the dimmed thumbnail while loading. */
@@ -303,7 +339,9 @@ class PreviewSection(
     private fun drawWaiting(g: GuiGraphicsCompat, area: UiRect) {
         // YouTube thumbnails are always 16:9, regardless of the screen's own block shape.
         val box = fitRatio(area, THUMBNAIL_RATIO)
-        val thumb = currentThumbnail()
+        // While a saved resume is pending, prefer the target frame over the platform cover.
+        val resumeFrame = waitingResumeFrame()
+        val thumb = resumeFrame ?: if (ds.savedTimeNanos > 0L) null else currentThumbnail()
         when {
             thumb != null -> {
                 blitTexture(g, thumb, box.x, box.y, box.w, box.h)
@@ -348,6 +386,8 @@ class PreviewSection(
         val published: String?,
         val isNew: Boolean,
         val platform: MediaPlatform,
+        /** Bilibili creator id, required to open the uploader page. */
+        val uploaderId: Long? = null,
     )
 
     /**
@@ -439,7 +479,10 @@ class PreviewSection(
     private fun platformOverlayInfo(url: String, platform: MediaPlatform, meta: PlatformVideoMetadata?): OverlayInfo =
         OverlayInfo(
             title = meta?.title ?: CustomMediaUrls.displayName(url),
-            uploader = meta?.uploader ?: CustomMediaUrls.hostOf(url),
+            // Bilibili's host is always the same site name, so it would read as noise where the
+            // uploader goes: leave that slot empty until the real creator name is known.
+            uploader = meta?.uploader
+                ?: if (platform == MediaPlatform.BILIBILI) null else CustomMediaUrls.hostOf(url),
             uploaderAvatarUrl = meta?.uploaderAvatarUrl,
             isVerified = false,
             views = watchOrViewCount(meta?.viewCount, meta?.isLive == true),
@@ -447,6 +490,7 @@ class PreviewSection(
             published = null,
             isNew = false,
             platform = platform,
+            uploaderId = meta?.uploaderId,
         )
 
     /** [OverlayInfo] for a custom link: file name as the title, host in place of a channel. */
@@ -464,10 +508,15 @@ class PreviewSection(
 
     /** Formats a viewer / view count, labelling it "watching" while live and "views" otherwise. */
     private fun watchOrViewCount(count: Long?, isLive: Boolean): String = count?.let {
-        formatCompactCount(it) + " " + translatableText(
+        val shown = if (isLive) formatLiveViewers(it) else formatCompactCount(it)
+        shown + " " + translatableText(
             if (isLive) "dreamdisplayx.ui.watching" else "dreamdisplayx.ui.views_short",
         ).string
     } ?: ""
+
+    /** Live audience: plain digits below 10k, one decimal plus a `w` suffix above it. */
+    private fun formatLiveViewers(v: Long): String =
+        if (v >= 10_000L) String.format(java.util.Locale.ROOT, "%.1fw", v / 10_000.0) else v.toString()
 
     /** Draws the dark strip with the video title (+NEW tag) and channel / views / likes / date metadata. */
     private fun drawTitleOverlay(g: GuiGraphicsCompat, x: Int, y: Int, w: Int) {
@@ -483,9 +532,14 @@ class PreviewSection(
         val textW = w - padX * 2
         var shown = UiText.trim(font, title, textW)
 
-        val boxH = font.lineHeight * 2 + padY * 3
+        val showParts = ds.parts.size > 1 && currentSource() is MediaSource.Bilibili
+        val boxH = font.lineHeight * (if (showParts) 3 else 2) + padY * 3
         val boxY = y - boxH
+        partPopupAnchorY = boxY
+        partPopupX = x
+        partPopupW = w
         g.fill(x, boxY, x + w, y, UiTheme.OVERLAY_SCRIM)
+        drawPartChips(g, x, y, w, font)
 
         var titleX = x + padX
         val titleY = boxY + padY
@@ -523,7 +577,8 @@ class PreviewSection(
         }
 
         val metaY = boxY + padY + font.lineHeight + padY
-        var metaX = x + padX
+        val metaRowX = x + padX
+        var metaX = metaRowX
         var metaW = textW
         val avatarUrl = info.uploaderAvatarUrl
         val avatar = avatarUrl?.let { Thumbnails.get(it) }
@@ -541,17 +596,148 @@ class PreviewSection(
             metaX += badgeSize + 3
             metaW -= badgeSize + 3
         }
+        val uploaderName = info.uploader.orEmpty()
+        if (uploaderName.isNotEmpty()) {
+            val nameW = font.width(UiText.trim(font, uploaderName, metaW))
+            val mid = info.uploaderId
+            if (nameW > 0 && mid != null && onOpenUploader != null) {
+                uploaderHitRect = UiRect(metaRowX, metaY - 2, metaX + nameW - metaRowX, font.lineHeight + 3)
+                uploaderHitUser = BilibiliUserItem(
+                    mid = mid,
+                    name = uploaderName,
+                    avatarUrl = info.uploaderAvatarUrl,
+                )
+            }
+        }
         g.drawText(
             font, UiText.trim(font, parts.toString(), metaW),
             metaX, metaY, UiTheme.TEXT_SECONDARY, false,
         )
     }
 
+    /** True while the part picker is open; a click anywhere else closes it. */
+    private var partListOpen = false
+
+    /** First part row the picker shows; paged with the ▲ / ▼ rows when there are more. */
+    private var partListScroll = 0
+
+    /** Part rows per picker page. */
+    private var partListPageSize = PART_LIST_ROWS
+
+    /** Top of the video area, so the picker never grows out of it. */
+    private var partListVideoTop = 0
+
+    /** Top edge of the preview info card; the picker hangs above it so it never covers the card. */
+    private var partPopupAnchorY = 0
+
+    /** Preview panel x / width, captured with the info card so the picker uses the same frame. */
+    private var partPopupX = 0
+    private var partPopupW = 0
+
+    /** Last mouse position seen by [render], used to highlight the hovered part row. */
+    private var lastMouseX = 0
+    private var lastMouseY = 0
+
+    /** Draws the current-part chip; the popup is added to the end of [render] so it sits on top. */
+    private fun drawPartChips(g: GuiGraphicsCompat, x: Int, y: Int, w: Int, font: net.minecraft.client.gui.Font) {
+        partHitRects.clear()
+        val parts = ds.parts
+        if (parts.size <= 1) {
+            partListOpen = false
+            return
+        }
+        val total = parts.size
+        val current = ds.currentPart
+        val currentPart = parts.firstOrNull { it.page == current } ?: parts[0]
+        val rowY = y - font.lineHeight - 2
+        // Fixed width, like the popup, so switching parts never resizes the chip.
+        val chipW = min(w - 8, PART_LIST_MAX_W)
+        val rect = UiRect(x + 4, rowY - 1, chipW, font.lineHeight + 1)
+        val hovered = rect.contains(lastMouseX, lastMouseY)
+        g.fill(
+            rect.x, rect.y, rect.right, rect.bottom,
+            when {
+                partListOpen -> UiTheme.ACCENT_BILIBILI_TAG
+                hovered -> 0xC03A3A46.toInt()
+                else -> 0x8C000000.toInt()
+            },
+        )
+        val label = UiText.trim(font, "P$current/$total · ${currentPart.title} ▾", chipW - 8)
+        g.drawText(font, label, rect.x + 4, rowY, UiTheme.TEXT_PRIMARY, false)
+        partHitRects += rect to PART_LIST_TOGGLE
+    }
+
+    /** Draws the part picker above the info card: fixed width, fixed rows, right-aligned lengths. */
+    private fun drawPartList(g: GuiGraphicsCompat, font: net.minecraft.client.gui.Font, mouseX: Int, mouseY: Int) {
+        val parts = ds.parts
+        if (parts.size <= 1) {
+            partListOpen = false
+            return
+        }
+        val current = ds.currentPart
+        val rowH = font.lineHeight + 4
+        val fitRows = ((partPopupAnchorY - 8 - partListVideoTop) / rowH).coerceIn(3, PART_LIST_ROWS + 2)
+        partListPageSize = (fitRows - 2).coerceIn(2, PART_LIST_ROWS)
+        partListScroll = partListScroll.coerceIn(0, (parts.size - partListPageSize).coerceAtLeast(0))
+        val rows = partListPageSize
+        val hasUp = partListScroll > 0
+        val hasDown = partListScroll + rows < parts.size
+        val boxW = min(partPopupW - 8, PART_LIST_MAX_W)
+        val boxX = partPopupX + 4
+        // Two fixed paging rows keep the box the same height on every page, so nothing jumps.
+        val boxH = (rows + 2) * rowH + 4
+        val boxY = partPopupAnchorY - 3 - boxH
+        g.fill(boxX, boxY, boxX + boxW, boxY + boxH, UiTheme.PLACEHOLDER_BG)
+        g.drawOutline(UiRect(boxX, boxY, boxW, boxH), UiTheme.PANEL_BORDER)
+
+        val numW = font.width("P99") + 6
+        val durRight = boxX + boxW - 6
+        var rowY = boxY + 2
+        fun pager(label: String, page: Int, enabled: Boolean) {
+            val rect = UiRect(boxX + 1, rowY, boxW - 2, rowH)
+            if (enabled && rect.contains(mouseX, mouseY)) {
+                g.fill(rect.x, rect.y, rect.right, rect.bottom, PART_HOVER_FILL)
+            }
+            g.drawText(
+                font, label, rect.x + 4, rowY + 2,
+                if (enabled) UiTheme.TEXT_SECONDARY else 0xFF6E6E6E.toInt(), false,
+            )
+            if (enabled) partHitRects += rect to page
+            rowY += rowH
+        }
+        pager(translatableText("dreamdisplayx.ui.parts_earlier").string, PART_PAGE_BACK, hasUp)
+        for (i in 0 until rows) {
+            val part = parts.getOrNull(partListScroll + i)
+            val rect = UiRect(boxX + 1, rowY, boxW - 2, rowH)
+            if (part != null) {
+                val selected = part.page == current
+                if (selected) {
+                    g.fill(rect.x, rect.y, rect.right, rect.bottom, UiTheme.ACCENT_BILIBILI_TAG)
+                } else if (rect.contains(mouseX, mouseY)) {
+                    g.fill(rect.x, rect.y, rect.right, rect.bottom, PART_HOVER_FILL)
+                }
+                val textColor = if (selected) UiTheme.TEXT_PRIMARY else UiTheme.TEXT_DIM
+                g.drawText(font, "P${part.page}", boxX + 5, rowY + 2, textColor, false)
+                val length = PlaybackClock.format(part.durationSec * 1000L)
+                val lengthX = durRight - font.width(length)
+                g.drawText(font, length, lengthX, rowY + 2, UiTheme.TEXT_META, false)
+                val titleX = boxX + 5 + numW
+                val titleW = lengthX - 4 - titleX
+                if (titleW > font.width("WWW")) {
+                    g.drawText(font, UiText.trim(font, part.title, titleW), titleX, rowY + 2, textColor, false)
+                }
+                partHitRects += rect to part.page
+            }
+            rowY += rowH
+        }
+        pager(translatableText("dreamdisplayx.ui.parts_later").string, PART_PAGE_FORWARD, hasDown)
+    }
+
     /** Formats [v] compactly (e.g. "1.2M"), or its plain value below 1000. */
     private fun formatCompactCount(v: Long): String = when {
-        v >= 1_000_000_000L -> String.format("%.1fB", v / 1_000_000_000.0)
-        v >= 1_000_000L -> String.format("%.1fM", v / 1_000_000.0)
-        v >= 1_000L -> String.format("%.1fK", v / 1_000.0)
+        v >= 1_000_000_000L -> String.format(java.util.Locale.ROOT, "%.1fB", v / 1_000_000_000.0)
+        v >= 1_000_000L -> String.format(java.util.Locale.ROOT, "%.1fM", v / 1_000_000.0)
+        v >= 1_000L -> String.format(java.util.Locale.ROOT, "%.1fK", v / 1_000.0)
         else -> v.toString()
     }
 
@@ -642,6 +828,15 @@ class PreviewSection(
         return null
     }
 
+    /** Frame at the pending resume position, or null while extraction is still running. */
+    private fun waitingResumeFrame(): Identifier? {
+        if (ds.isVideoStarted || ds.savedTimeNanos <= 0L) return null
+        val key = ds.videoUrl ?: return null
+        val rawUrl = ds.scrubPreviewRawUrl ?: return null
+        ScrubPreview.request(key, rawUrl, ds.mediaPlayerDurationNanos, ds.scrubPreviewSeeksByDecoding)
+        return ScrubPreview.frameAt(key, ds.savedTimeNanos)
+    }
+
     private fun blitTexture(g: GuiGraphicsCompat, id: Identifier, x: Int, y: Int, w: Int, h: Int) {
         //? if >=1.21.11 {
         g.blit(RenderPipelines.GUI_TEXTURED, id, x, y, 0f, 0f, w, h, w, h)
@@ -655,6 +850,76 @@ class PreviewSection(
         // last frame (and its GPU texture) survives menu close/reopen; DisplayScreen.unregister() owns
         // its teardown.
         ambientSampler.close()
+    }
+
+    /** Drops the click target, e.g. while the preview is not being drawn. */
+    fun clearHitTargets() {
+        uploaderHitRect = null
+        uploaderHitUser = null
+    }
+
+    /**
+     * Opens the creator page when the click lands on the uploader chip (avatar + name) recorded while
+     * drawing the overlay. Returns true when the click was consumed.
+     */
+    fun handleUploaderClick(mouseX: Double, mouseY: Double): Boolean {
+        val rect = uploaderHitRect ?: return false
+        val user = uploaderHitUser ?: return false
+        val callback = onOpenUploader ?: return false
+        if (!rect.contains(mouseX.toInt(), mouseY.toInt())) return false
+        callback(user)
+        return true
+    }
+
+    /** Part chips drawn in the title overlay this frame: hit box to 1-based part number. */
+    private val partHitRects = mutableListOf<Pair<UiRect, Int>>()
+
+    /** Switches the display to the clicked part, or opens / pages the picker. Returns true when consumed. */
+    fun handlePartClick(mouseX: Double, mouseY: Double): Boolean {
+        val mx = mouseX.toInt()
+        val my = mouseY.toInt()
+        val hit = partHitRects.firstOrNull { it.first.contains(mx, my) }
+        if (hit == null) {
+            // The open picker swallows the click that dismisses it, so it cannot also press a button.
+            if (!partListOpen) return false
+            partListOpen = false
+            return true
+        }
+        when (hit.second) {
+            PART_LIST_TOGGLE -> partListOpen = !partListOpen
+            PART_PAGE_BACK -> partListScroll = (partListScroll - partListPageSize).coerceAtLeast(0)
+            PART_PAGE_FORWARD -> partListScroll += partListPageSize
+            else -> {
+                partListOpen = false
+                switchToPart(hit.second)
+            }
+        }
+        return true
+    }
+
+    /** Steps the open picker to the previous / next part; false when the picker is closed. */
+    fun stepPart(delta: Int): Boolean {
+        if (!partListOpen) return false
+        val parts = ds.parts
+        if (parts.size <= 1) return false
+        val index = parts.indexOfFirst { it.page == ds.currentPart }.coerceAtLeast(0)
+        val target = (index + delta).coerceIn(0, parts.size - 1)
+        if (target == index) return true
+        // Keep the row just switched to inside the visible page.
+        if (target < partListScroll) partListScroll = target
+        if (target >= partListScroll + partListPageSize) partListScroll = target - partListPageSize + 1
+        switchToPart(parts[target].page)
+        return true
+    }
+
+    /** Switches the display to [page] through the server; shared by the picker clicks and arrow keys. */
+    private fun switchToPart(page: Int) {
+        val source = currentSource() as? MediaSource.Bilibili ?: return
+        val bvid = source.bvid ?: return
+        if (page == ds.currentPart) return
+        DreamServices.registry.get(DisplayServices.DISPLAY).setUrl(
+            DisplayId(ds.uuid), "https://www.bilibili.com/video/$bvid?p=$page", ds.lang,
+        )
     }
 
     private class AmbientFrameSampler(private val ds: DisplayScreen) {

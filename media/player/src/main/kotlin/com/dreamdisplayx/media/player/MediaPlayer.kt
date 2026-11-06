@@ -47,6 +47,8 @@ class MediaPlayer(
     private val env: PlaybackEnvironment,
     replayBootstrap: ReplayBootstrap? = null,
     private val audioStage: AudioDspStage? = null,
+    initialPositionNanos: Long = 0L,
+    startPaused: Boolean = false,
 ) {
     /** Generation captured at construction so queued EOS callbacks identify their source player. */
     private val playbackGeneration = host.playbackGeneration
@@ -127,6 +129,15 @@ class MediaPlayer(
          * EOF) and the player stalls or restarts from the beginning instead of playing the tail.
          */
         private const val SEEK_END_GUARD_NANOS = 500_000_000L
+
+        /**
+         * Window after a seek/reopen in which END_REACHED is treated as an input artifact rather
+         * than a truncated stream: a fresh fragmented input can end right at the seek point.
+         */
+        private const val EARLY_EOS_SEEK_ARTIFACT_MS = 6_000L
+
+        /** Re-seeks allowed per session for an END_REACHED that arrives right after a seek. */
+        private const val MAX_SEEK_ARTIFACT_RETRIES = 2
 
         /**
          * On reappearance, cached replay resumes this far before the saved position. Default 0 = zero rewind: the saved position itself is the resume point.
@@ -325,6 +336,9 @@ class MediaPlayer(
     @Volatile
     private var lastQuality = 0
 
+    /** Re-seeks already spent on an END_REACHED that arrived right after a seek. */
+    private var seekArtifactRetries = 0
+
     @Volatile
     private var lastRequestedQuality = 0
 
@@ -341,6 +355,12 @@ class MediaPlayer(
     private class QualityRollback(val previousStreams: ActiveStreams, val previousQuality: Int, val target: Int)
 
     init {
+        // Seed the cold-start offset and pause gate before initialize() can start a session.
+        if (initialPositionNanos > 0L) primedStartPositionNanos.set(initialPositionNanos)
+        if (startPaused) {
+            pauseRequested.set(true)
+            sessionManager.setUserPauseRequested(true)
+        }
         // Show cached replay video immediately (network-free) so a reappearing display is instant,
         // in parallel with the live stream resolve happening on the init executor.
         replayBootstrap?.let { boot -> safeExecute { startReplayBootstrapVideo(boot) } }
@@ -371,6 +391,12 @@ class MediaPlayer(
             sessionManager.resume()
         }
     }
+
+    /** Re-queues the kept still frame so the wall shows a picture without resuming playback. */
+    fun pushStillFrame() = sessionManager.pushStillFrame()
+
+    /** Newest frame kept as a still, for surfaces created after playback paused or ended. */
+    fun lastFrameSnapshot(): PausedFrame? = sessionManager.lastFrameSnapshot()
 
     /** Stops playback permanently; the instance must not be used after this call. */
     fun stop() {
@@ -495,6 +521,9 @@ class MediaPlayer(
     fun getResumePositionNanos(): Long =
         sessionManager.parkedPositionNanos() ?: sessionManager.activeBridgeEdgeNanos() ?: getCurrentTime()
 
+    /** Frozen pause position, or null while the session is not parked. */
+    fun parkedPositionOrNull(): Long? = sessionManager.parkedPositionNanos()
+
     /** Stream duration in nanos, or 0 for live streams. */
     fun getDuration(): Long = if (liveStream) 0L else durationHintNanos
 
@@ -570,6 +599,12 @@ class MediaPlayer(
 
     /** True once the first decoded frame is ready for GPU upload. */
     fun textureFilled(): Boolean = sessionManager.textureFilled()
+
+    /** True once the decoder delivered its first frame for the current playback generation. */
+    fun hasFirstFrame(): Boolean = sessionManager.hasFirstFrame()
+
+    /** True while a seek is still waiting for the picture (frozen frame, audio silent). */
+    fun isSeekBuffering(): Boolean = sessionManager.isSeekBuffering()
 
     /** Discards any ready raw frame so the renderer will not show stale content after a timeline jump. */
     fun clearFrame() = sessionManager.clearFrame()
@@ -793,7 +828,7 @@ class MediaPlayer(
         env.renderExecutor.execute {
             host.reloadTexture()
             safeExecute {
-                if (sessionManager.isPlaying && !sessionManager.isParked()) startStreams(ss, pos)
+                if (sessionManager.isPlaying && !sessionManager.isParked()) startStreams(ss, pos, "restart-pipeline")
                 else clock.moveTo(pos)
             }
         }
@@ -832,8 +867,9 @@ class MediaPlayer(
         // Align the scrub rendition's CDN host to the playing stream's mirror: secondary renditions
         // skip CdnSpeedProbe, so the raw URL often points at a slow edge and every scrub-preview
         // seek timed out ("ScrubSession: frame timeout") before the extractor's budget expired.
-        val playingUrl = pm.streamSet.currentVideo?.url
-        return CdnSpeedProbe.alignSecondaryRenditionHost(scrubStreamOf(videos).url, playingUrl)
+        val playingUrl = activeVideoUrl ?: pm.streamSet.currentVideo?.url
+        val scrub = scrubStreamOf(videos)
+        return CdnSpeedProbe.alignSecondaryRendition(scrub.url, scrub.backupUrls, playingUrl)
     }
 
     /**
@@ -916,6 +952,10 @@ class MediaPlayer(
                 host.videoContentHeight = it.streamSet.currentVideo.height ?: 0
             }
 
+            // A live stream has no position to resume, so a start-paused seed (the display's saved
+            // paused flag) parked it right after the first frame: sound for a second, then silence.
+            if (liveStream && !sessionManager.isUserPauseRequested()) pauseRequested.set(false)
+
             if (DEBUG) {
                 logger.debug(
                     "{} video={} audio={}",
@@ -930,7 +970,8 @@ class MediaPlayer(
             // One-shot consumption: a primed resume position (early-EOS retry, pre-start seek)
             // must not leak into later initializations.
             val primed = primedStartPositionNanos.getAndSet(-1L).takeIf { it >= 0L } ?: 0L
-            val requestedOffset = replayBootstrapRef.get()?.positionNanos ?: primed
+            // Live has no timeline: never carry a remembered / primed offset into it.
+            val requestedOffset = if (liveStream) 0L else (replayBootstrapRef.get()?.positionNanos ?: primed)
             // Apply the same VOD tail guard to every cold-start source, including replay and
             // early-EOS recovery bootstrap offsets, rather than only the doPlay() path.
             val initialOffset = resumeOffsetFor(requestedOffset, durationHintNanos)
@@ -939,7 +980,7 @@ class MediaPlayer(
                     requestedOffset / 1_000_000L, durationHintNanos / 1_000_000L)
             }
 
-            safeExecute { if (!terminated.get()) startStreams(prepared.streamSet, initialOffset) }
+            safeExecute { if (!terminated.get()) startStreams(prepared.streamSet, initialOffset, "prepare") }
         }.onSuccess {
             drainInitCallbacks(run = true)
         }.onFailure { e ->
@@ -957,18 +998,15 @@ class MediaPlayer(
     /**
      * Starts session manager (control executor thread only).
      */
-    private fun startStreams(streamSet: ActiveStreams, offsetNanos: Long) {
+    private fun startStreams(streamSet: ActiveStreams, offsetNanos: Long, reason: String) {
         if (terminated.get()) return
-        logger.info("$debugLabel startStreams() cold start (t={}ms, live={}).", offsetNanos / 1_000_000L, liveStream)
-        if (pauseRequested.get()) {
-            // Paused while this was being resolved: honor that rather than starting under the viewer
-            logger.debug("$debugLabel Start skipped: playback was paused while the media was being prepared.")
-            state.set(PlaybackState.PAUSED)
-            // Keep the offset for the upcoming resume so it doesn't restart at 0.
-            primedStartPositionNanos.set(offsetNanos)
-            return
-        }
+        logger.info("$debugLabel startStreams() cold start (t={}ms, live={}, reason={}).", offsetNanos / 1_000_000L, liveStream, reason)
+        // A paused start still has to decode: skipping the session left the display on the loading
+        // placeholder with no frame ever reaching the texture. Start, take the first frame at the
+        // resume offset, then park (warm pause) so that frame stays on screen.
         endedAtEnd.set(false)
+        // A fresh session restores the re-seek budget that an END_REACHED artifact may have used up.
+        seekArtifactRetries = 0
         // Replay-only video may already be on screen (started at construction): attach the live source
         // and hand off by PTS instead of cold-starting, so the picture never blanks.
         val bootstrap = replayBootstrapRef.getAndSet(null)
@@ -1007,6 +1045,7 @@ class MediaPlayer(
                 probedStreamSet,
                 offsetNanos,
                 lastQuality,
+                live = liveStream,
             )
             if (!started) {
                 logger.error("$debugLabel Media session did not start.")
@@ -1029,13 +1068,60 @@ class MediaPlayer(
             return
         }
         if (sessionManager.isPlaying) {
-            state.set(PlaybackState.PLAYING)
+            if (pauseRequested.get()) {
+                // Park on the frame just decoded at the resume offset; same state as a warm pause,
+                // so the next play() only has to unpause instead of cold-starting from zero.
+                if (host.hasRenderedFrame) {
+                    sessionManager.suspend(allowExternalProcess = true, retainBuffered = true)
+                    sessionManager.repositionParked(offsetNanos)
+                    state.set(PlaybackState.PAUSED)
+                } else {
+                    // A slow first upload must not be parked into a blank session: keep the input
+                    // running and suspend only once a frame actually reached the GPU texture.
+                    logger.warn("$debugLabel first frame not uploaded yet; deferring park.")
+                    state.set(PlaybackState.PAUSED)
+                    parkAfterFirstFrame(offsetNanos)
+                }
+            } else {
+                state.set(PlaybackState.PLAYING)
+            }
             // Keep the retry budget across early-EOS restarts: a session that delivers one frame
             // and then dies must not reset the consecutive-failure cap on every retry.
             refreshWarmAudioTracks()
             // Settles the live quality path, which applies by restarting the whole session.
             qualitySwitching.set(false)
         }
+    }
+
+    /**
+     * Parks a startPaused session only after its first decoded frame arrives. Avoids parking a
+     * blank libvlc input when the CDN takes longer than the first-frame latch timeout.
+     */
+    private fun parkAfterFirstFrame(offsetNanos: Long) {
+        daemon({
+            val deadline = System.nanoTime() + 30_000_000_000L
+            while (System.nanoTime() < deadline && !terminated.get()) {
+                if (!pauseRequested.get()) return@daemon
+                if (host.hasRenderedFrame) {
+                    safeExecute {
+                        if (terminated.get() || !pauseRequested.get() ||
+                            !sessionManager.isPlaying || sessionManager.isParked()
+                        ) return@safeExecute
+                        sessionManager.suspend(allowExternalProcess = true, retainBuffered = true)
+                        sessionManager.repositionParked(offsetNanos)
+                        state.set(PlaybackState.PAUSED)
+                        logger.info("$debugLabel parked after deferred first frame.")
+                    }
+                    return@daemon
+                }
+                try {
+                    Thread.sleep(100L)
+                } catch (_: InterruptedException) {
+                    return@daemon
+                }
+            }
+            logger.warn("$debugLabel first frame still unavailable; leaving the session playing.")
+        }, "MediaPlayer-park-first-frame").start()
     }
 
     /**
@@ -1131,6 +1217,24 @@ class MediaPlayer(
             val duration = durationHintNanos
             val earlyEnd = isEarlyEos(position, duration)
             if (earlyEnd) {
+                // A reopened fragmented input can report END_REACHED right where it was positioned.
+                // Re-seek there instead of throwing the session away and re-resolving the stream.
+                val seekArtifact = streams
+                if (seekArtifact != null && sessionManager.repositionedWithin(EARLY_EOS_SEEK_ARTIFACT_MS) &&
+                    seekArtifactRetries < MAX_SEEK_ARTIFACT_RETRIES
+                ) {
+                    seekArtifactRetries++
+                    endedAtEnd.set(false)
+                    clock.reset(position)
+                    logger.warn(
+                        "$debugLabel Early EOS at {}ms of {}ms right after a seek; re-seeking instead of re-resolving ({}).",
+                        position / 1_000_000L, duration / 1_000_000L, seekArtifactRetries,
+                    )
+                    // Defer to the control executor: this callback must not reposition a native
+                    // player from inside the libvlc event that reported the end.
+                    safeExecute { sessionManager.beginSeek(seekArtifact, position, lastQuality) }
+                    return
+                }
                 logger.warn(
                     "$debugLabel Early EOS at {}ms of {}ms; re-resolving instead of looping.",
                     position / 1_000_000L, duration / 1_000_000L,
@@ -1168,6 +1272,14 @@ class MediaPlayer(
                 // Final frame stays on screen: tear the session down (Android pauses instead of stopping) and
                 // park in PAUSED so a later play resumes from the end rather than re-running the tail.
                 endedAtEnd.set(true)
+                // Park the software clock at the real end so the menu progress bar does not fall back
+                // to clock.originNanos (the last seek target) after stopSession().
+                val finalPosition = if (durationHintNanos > 0L) durationHintNanos else position
+                clock.reset(finalPosition)
+                logger.info(
+                    "$debugLabel playback ended at {}ms; parking progress at {}ms.",
+                    position / 1_000_000L, finalPosition / 1_000_000L,
+                )
                 safeExecute {
                     stopSession()
                     state.set(PlaybackState.PAUSED)
@@ -1207,7 +1319,7 @@ class MediaPlayer(
                     // first session's origin and the position grows past the VOD duration.
                     clock.reset(0L)
                     if (!sessionManager.beginSeek(ss, 0, lastQuality)) {
-                        startStreams(ss, 0)
+                        startStreams(ss, 0, "loop-restart")
                     }
                     events.onSeek(0L)
                 }
@@ -1242,8 +1354,10 @@ class MediaPlayer(
 
     /** Starts `FFmpeg` from the current seek offset. No-op if already playing or not ready. */
     private fun doPlay() {
-        if (!isReady || terminated.get()) return
+        if (terminated.get()) return
         pauseRequested.set(false)
+        sessionManager.setUserPauseRequested(false)
+        if (!isReady) return
         if (isPausedWarm()) {
             sessionManager.resume()
             state.set(PlaybackState.PLAYING)
@@ -1270,14 +1384,20 @@ class MediaPlayer(
         // session from that frozen offset immediately reaches EOS, which looks like a few
         // seconds of playback followed by an endless replay loop. Treat a tail position as
         // completed playback and restart from the beginning instead.
-        val requestedOffset = if (endedAtEnd.getAndSet(false)) 0L else clock.originNanos
+        val primed = primedStartPositionNanos.getAndSet(-1L).takeIf { it >= 0L }
+        // A live stream has no timeline: resuming it at a remembered offset only makes the input wait
+        // for a position that never arrives — the log showed "cold start (t=879291ms, live=true)"
+        // followed by "libvlc first frame timeout" and ten seconds of blank.
+        val requestedOffset = if (liveStream) 0L
+        else if (endedAtEnd.getAndSet(false)) 0L
+        else (primed ?: getResumePositionNanos())
         val offset = resumeOffsetFor(requestedOffset, durationHintNanos)
         if (offset != requestedOffset) {
             logger.info("$debugLabel Ignoring stale tail resume at {}ms of {}ms; restarting from 0ms.",
                 requestedOffset / 1_000_000L, durationHintNanos / 1_000_000L)
             clock.reset(0L)
         }
-        startStreams(ss, offset)
+        startStreams(ss, offset, "play")
     }
 
     /**
@@ -1285,8 +1405,21 @@ class MediaPlayer(
      */
     private fun doPause() {
         pauseRequested.set(true)
-        if (!sessionManager.isPlaying) return
+        sessionManager.setUserPauseRequested(true)
+        if (!isReady) return
+        // A pause pressed before the first decoded frame must not park an empty session: remember
+        // the intent here and let startStreams() park after the frame arrives.
+        if (!sessionManager.isPlaying || !sessionManager.hasFirstFrame()) {
+            state.set(PlaybackState.PAUSED)
+            return
+        }
         if (!liveStream) {
+            // Already parked (e.g. started paused): keep the frozen anchor instead of re-reading a
+            // clock that has advanced since the park.
+            if (sessionManager.isParked()) {
+                state.set(PlaybackState.PAUSED)
+                return
+            }
             if (sessionManager.suspend(allowExternalProcess = true, retainBuffered = true)) {
                 state.set(PlaybackState.PAUSED)
                 return
@@ -1344,9 +1477,11 @@ class MediaPlayer(
             // play() then fell into doPlay's cold start at the seek target, which the user saw
             // as "seeking creates a brand-new player". beginSeek's resume block only re-plays
             // STOPPED/ENDED players, so a parked session stays parked at the new position.
+            // libvlc refuses a runtime set_time on some Bilibili DASH inputs; the session manager
+            // re-opens only the video input at the target when that happens.
             if (!sessionManager.beginSeek(ss, target, lastQuality)) {
                 logger.warn("$debugLabel Seek to ${target / 1_000_000} ms fell back to a full stream restart.")
-                startStreams(ss, target)
+                startStreams(ss, target, "seek-fallback")
             } else {
                 // A warm-paused/parked session reads its position back from the park anchor
                 // (UI progress + resume position); keep it in step with the seek.
@@ -1359,7 +1494,7 @@ class MediaPlayer(
             primedStartPositionNanos.set(target)
             if (state.get() != PlaybackState.RESTARTING && !terminated.get()) {
                 logger.warn("$debugLabel Seek to ${target / 1_000_000} ms with a dead session; restarting at target.")
-                startStreams(ss, target)
+                startStreams(ss, target, "seek-fallback")
             }
         }
         // The target is parked above so an in-flight restart and the UI both retain the requested

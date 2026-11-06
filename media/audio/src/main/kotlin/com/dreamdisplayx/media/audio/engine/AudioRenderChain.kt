@@ -70,8 +70,14 @@ internal class AudioRenderChain(
     override fun process(buf: ByteArray, len: Int, legacyGain: Double) {
         val st = state
         val tier = engine.currentQuality()
-        if (tier == AcousticQuality.OFF || st == null || st.bypassSpatial || !st.acousticsEnabled) {
+        if (tier == AcousticQuality.OFF || st == null || !st.acousticsEnabled) {
             applyLegacyGain(buf, len, legacyGain)
+            return
+        }
+        // Popout / window playback skips spatialisation but keeps the loudness normaliser: both paths
+        // then target the same loudness, so switching between them changes the space, not the level.
+        if (st.bypassSpatial) {
+            processUnspatialized(buf, len, legacyGain, tier)
             return
         }
 
@@ -100,11 +106,15 @@ internal class AudioRenderChain(
         val leftEmitter = EmitterLayout.leftEmitter(center, uAxis, plane.width)
         val rightEmitter = EmitterLayout.rightEmitter(center, uAxis, plane.width)
 
+        // A borderless overlay fills the viewport, so the wall's own distance must not attenuate it.
+        val leftDistance = if (st.flatDistance) refDistance else (listenerPos - leftEmitter).length()
+        val rightDistance = if (st.flatDistance) refDistance else (listenerPos - rightEmitter).length()
+
         val gL = distanceGainL.next(
-            EmitterLayout.distanceGain((listenerPos - leftEmitter).length(), refDistance).toFloat(), dtBlock,
+            EmitterLayout.distanceGain(leftDistance, refDistance).toFloat(), dtBlock,
         ) * directivity
         val gR = distanceGainR.next(
-            EmitterLayout.distanceGain((listenerPos - rightEmitter).length(), refDistance).toFloat(), dtBlock,
+            EmitterLayout.distanceGain(rightDistance, refDistance).toFloat(), dtBlock,
         ) * directivity
 
         val azL = azimuthL.next(azimuthOf(leftEmitter, listenerPos, listenerForward, listenerRight), dtBlock)
@@ -132,7 +142,11 @@ internal class AudioRenderChain(
         val occ = env.occlusion.coerceIn(0f, 1f)
         val cutoffTarget = if (advanced) {
             val occCutoff = MAX_CUTOFF_HZ * (MIN_OCCLUSION_CUTOFF_HZ / MAX_CUTOFF_HZ).pow(occ)
-            val centerDist = max(AIR_ABSORPTION_REF_DISTANCE, (listenerPos - center).length().toFloat())
+            val centerDist = if (st.flatDistance) {
+                AIR_ABSORPTION_REF_DISTANCE
+            } else {
+                max(AIR_ABSORPTION_REF_DISTANCE, (listenerPos - center).length().toFloat())
+            }
             val airCutoff =
                 max(AIR_ABSORPTION_MIN_CUTOFF_HZ, MAX_CUTOFF_HZ * (AIR_ABSORPTION_REF_DISTANCE / centerDist))
             min(occCutoff, airCutoff)
@@ -201,6 +215,39 @@ internal class AudioRenderChain(
             }
         }
 
+        encode(buf, frames)
+    }
+
+    /**
+     * Loudness-normalised but unspatialised output, used while the source plays in a popout window.
+     * [legacyGain] carries the user volume and the distance attenuation the caller applies, exactly as
+     * the plain [applyLegacyGain] path does; the makeup gain is the same stage the spatial path uses.
+     */
+    private fun processUnspatialized(buf: ByteArray, len: Int, legacyGain: Double, tier: AcousticQuality) {
+        val advanced = tier == AcousticQuality.ADVANCED || tier == AcousticQuality.ULTRA
+        if (!advanced) {
+            applyLegacyGain(buf, len, legacyGain)
+            return
+        }
+        val frames = len / 4
+        if (frames <= 0) return
+        ensureCapacity(frames)
+        decode(buf, frames)
+        val dtSample = 1f / sampleRate
+        for (i in 0 until frames) loudness.observe(floatL[i], floatR[i], dtSample)
+        val makeup = loudness.makeupGain(
+            TARGET_LUFS,
+            MAX_LOUDNESS_BOOST_DB,
+            MAX_LOUDNESS_CUT_DB,
+            MAX_LOUDNESS_SLEW_DB_PER_SEC,
+            frames / sampleRate,
+        )
+        val gain = (legacyGain * makeup).toFloat()
+        for (i in 0 until frames) {
+            limiter.process(floatL[i] * gain, floatR[i] * gain)
+            floatL[i] = limiter.lastL
+            floatR[i] = limiter.lastR
+        }
         encode(buf, frames)
     }
 

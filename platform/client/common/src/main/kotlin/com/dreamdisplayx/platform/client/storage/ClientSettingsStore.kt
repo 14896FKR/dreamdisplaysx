@@ -108,9 +108,10 @@ object ClientSettingsStore : ClientSettingsStorage {
     }
 
     /** Sets the last known playback position for [displayUuid] and saves. */
-    override fun setSavedTimeNanos(displayUuid: UUID, nanos: Long) {
+    override fun setSavedTimeNanos(displayUuid: UUID, nanos: Long, videoUrl: String?) {
         val s = getSettings(displayUuid)
         s.savedTimeNanos = nanos
+        s.savedVideoUrl = videoUrl
         save()
     }
 

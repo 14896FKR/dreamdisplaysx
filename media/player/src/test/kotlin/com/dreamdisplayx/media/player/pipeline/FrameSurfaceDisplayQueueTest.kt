@@ -5,6 +5,8 @@ import com.dreamdisplayx.api.media.player.FrameUploader
 import com.dreamdisplayx.api.media.player.FrameUploaderFactory
 import com.dreamdisplayx.api.media.player.GpuTextureRef
 import java.nio.ByteBuffer
+import java.util.Collections
+import java.util.IdentityHashMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -99,5 +101,22 @@ class FrameSurfaceDisplayQueueTest {
             val taken = (1..10).mapNotNull { surface.takeReusableFrameBuffer(64) }
             assertEquals(4, taken.size, "Pool cap per retained buffer, broken on round $round.")
         }
+    }
+
+    /** The producer path must present its buffer and reuse the pool instead of allocating every frame. */
+    @Test
+    fun `present reuses the frame buffer pool across frames`() {
+        val (surface, _) = newSurface()
+        surface.enableDisplaySync({ 0L }, 0L)
+        val seen = Collections.newSetFromMap(IdentityHashMap<ByteBuffer, Boolean>())
+        repeat(20) {
+            val buffer = surface.takeOrAllocate(64)
+            seen.add(buffer)
+            buffer.clear()
+            buffer.put(1)
+            surface.present(buffer, 0L)
+            assertTrue(surface.updateFrame(FakeTexture(), 4, 4, 4, 4))
+        }
+        assertTrue(seen.size <= 4, "Producer path allocated ${seen.size} buffers instead of reusing the pool.")
     }
 }

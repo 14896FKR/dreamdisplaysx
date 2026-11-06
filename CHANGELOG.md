@@ -1,3 +1,123 @@
+# Unreleased
+
+## Client
+
+### Features
+
+- Audio/video sync now samples both clocks every 5 s and logs `A/V sample` lines with the PCM counters.
+- Added an opt-in sample-level sync corrector (`-Ddreamdisplayx.avServo=true`) that skips or repeats PCM instead of seeking the audio input.
+- Borderless freezes walking and camera turning, so the acoustics listener pose stops moving and the positional gain stops jumping. Fullscreen started by the server is excluded, so a forced broadcast never takes the player's input away.
+- Added the Borderless console: the chat key opens a chat-style command line (`play`, `pause`, `seek`, `vol`, `mute`, `p2`, `exit`, `help`) that reports each command on a single short status line, and `F` / arrows / space / `M` drive playback while the line is closed. `Dev` typed in chat toggles it for the session, and the new `borderless-console` config option turns it on by default.
+- A multi-part video can be jumped to from the console with `p2` (also `p 2` / `page 2`): it goes through the server like the part chips do and names the new part on the status line, answers `Not a multi-part video.` / `No part 7 (1-5).` instead of failing silently, and a bare `p` still toggles playback.
+- Pasted links keep their start timestamp: `?t=299.2`, `?t=1m30s` and `?start=` now set the initial playback position instead of starting at zero.
+- Bilibili links are cleaned on the way in: tracking noise (`spm_id_from`, `vd_source`, `share_*`, `bbid`, `from`, ...) is dropped and only `p` (part) and `t` (start offset) survive.
+- Esc in Borderless now closes the overlay directly, so the vanilla pause screen no longer flashes for a frame.
+- Pasted links are routed by type instead of always becoming a video: `space.bilibili.com/<mid>` opens that creator's page, `medialist/detail/ml<id>` and `favlist?fid=<id>` import the list into the playlist tab, and video / bangumi / live links still play directly.
+- PiliPlus playlist share links (`medialist/detail/ml<id>`, including a bare `ml<id>`) are recognised and imported through the favourites API.
+- The preview overlay's uploader avatar and name are clickable and open that creator's page (Bilibili videos; other sources have no creator page).
+- A Bilibili live room now shows its anchor's name and avatar in the preview meta line, and the anchor is clickable like a VOD uploader; the site host is no longer used as a stand-in name.
+- A live room's audience figure is now the concurrent viewer count from the room's online rank (`getOnlineGoldRank` → `onlineNum`), not the popularity score (`online`) and not the watched total; when a room has no online rank the number is simply omitted. Live counts read as plain digits below 10k and `x.xw` above it.
+- The anchor name / avatar of a live room now come from the H5 room card (`getH5InfoByRoom` → `anchor_info.base_info`), where they actually live; the play-info payload only carries the uid.
+- The Chinese live audience line reads `N 人正在观看`, and a creator page returns to the tab it was opened from (playlist row, preview card, search result, pasted space card) instead of always the display-settings tab.
+- Live playback runs with a shorter buffer: `--live-caching` dropped from 600 ms to 300 ms, and live media additionally gets `:clock-jitter=0` / `:clock-synchro=0` (VLC's low-latency preset), so a live stream starts and recovers sooner.
+- Live audio starts with the picture instead of ~7 s later: a live session no longer pre-warms the audio player paused (its demuxer stayed at a 0 ms clock, so the watchdog re-attached it twice), and its first-frame release no longer flushes the PCM line or re-closes the gate.
+- Seeks up to 16 s step in place instead of reopening the video input, which is what made every ±5 s / Shift step take 1-2 s; if the picture has not landed within 1.5 s the input is reopened exactly as before, and larger jumps keep the reopen path.
+- A live stream is no longer paused by server timeline state: its pause flag is a local decision now, so joining a live room no longer shows one frame and then parks (a stale paused flag in the timeline packet used to do exactly that).
+- A playlist advance keeps the Borderless overlay open instead of dropping the viewer back to the world, and an in-overlay video swap keeps the previous frame until the next one decodes, so the queue no longer flashes the loading animation between items.
+- The next queue entry is handed to the resolver for prefetching while the current one plays, and its resolution is reused once by the advance that follows (90 s, consumed immediately), so a playlist switch skips the playurl round trip without caching single-video playback.
+- Seeks no longer spend a fixed 1.5 s frozen: the landing verifier's first sample moved from 1.5 s to 400 ms (200 ms apart afterwards), and the timing line now measures request → first frame instead of the verifier's verdict. A landed seek can also no longer be reopened by the in-place fallback.
+- Playback keys pressed while the console is closed report a status line again, drawn by the fullscreen overlay itself: watch mode has no screen open, so the console screen's own line never rendered (that is why the earlier fix showed nothing).
+- `help` groups its rows (PLAY / SEEK / VOLUME / COMMAND), spells each row as `key = effect` and shows for 6 s; the block, and the watch-mode status line, share one dark-slate plate at 75% instead of a flat black box, so the line looks the same whether the console is open or was just closed with Esc.
+- The status / help plate follows the picture behind it: the overlay averages the frame under the plate straight off the CPU upload buffer (8x8 grid, every 250 ms, no GPU readback), the plate keeps that hue with its saturation pushed and its brightness dropped to 46/255, and it is more transparent (62%) with a feathered top edge and a feathered right edge, so it reads as the video dimmed rather than as a box laid over it.
+- After a seek the audio input is checked against the video clock; when a fragmented input refused `set_time` and kept its old position (sound seconds behind the picture) it is rebuilt at the target instead of drifting.
+- A seek no longer freezes the picture for up to 10 s: the landing verifier retries while the player is still opening instead of bailing out, and the fail-open deadline is 4 s.
+- A multi-part Bilibili selection now reports its own part's length instead of the whole video's: `data.duration` sums every part, so a two-part video with equal halves told the player it was twice as long, the part's real end read as an early EOS and the stream was re-resolved (the part replayed), and the seek bar stretched past the part's last frame, making its true end unreachable. The server also drops the remembered length when the video changes, so the new video's own duration report is accepted (it used to be first-report-wins forever).
+- The mouse wheel now scrolls only the panel it is over: the settings list and the playlist queue both accepted a wheel event from anywhere left of their scrollbar, which is why scrolling over the video preview moved the settings column instead. Both are bounded to their own rect.
+- While the part picker is open, up / down step to the previous / next part instead of changing the volume; with the picker closed the arrows keep adjusting volume as before.
+- A multi-part Bilibili video shows its current part as one fixed-width chip in the preview overlay (`P2/5 · title ▾`); clicking it opens a picker above the info card (drawn last, so it never covers the title / metadata lines) with a fixed width and a fixed number of rows: page number, title and a right-aligned length column, current part highlighted, hover wash on every row and on the chip, `▲` / `▼` paging rows always present so the box never jumps.
+- Steps up to 16 s seek in place, so a Shift+arrow step costs the same as a 5 s one instead of reopening the input.
+- A multi-part Bilibili video now continues into its next part when one ends, and the Borderless status line names it (`P2/5 · part title`), instead of jumping to the queue's next video without a word. The advance goes through the server like the part chips do: the server re-sends every display once a second and a `DisplayInfo` whose URL differs from the local one reloads that URL from its start, so a client-local advance was undone a second later and the finished part replayed. Only the display's owner advances, so several viewers reaching the end cannot reset the new part for each other.
+- The creator page shows charging and guard counts (`充电人数` / `舰长人数`) on their own line above the honour tags, as exact figures with thousand separators instead of `1.2K`-style rounding.
+- The creator page ends its header block with a live badge (`正在直播` / `Live Now`) aligned with the stats and honour-tag lines while Bilibili reports the room as streaming (`Room/get_info` → `live_status`); clicking it switches the display to that room unless it is already playing it.
+- Audience and view counts format with `Locale.ROOT`, so a comma-decimal locale cannot turn `1.2w` into `1,2w`.
+- The resume position written on world exit is decided by a new pure `ResumePositionPolicy` (headless-tested): the paused frame position while parked, the live clock while playing, never negative, and a position inside the 500 ms tail is written as 0 so the next join starts over instead of finishing instantly. The same policy now picks the resume position on rejoin (LOCAL prefers this client's save, everything else the server copy), and the exit path also pushes that position to the server, whose own reports are throttled and would otherwise stay stale for the next join.
+- The A/V servo is on by default: nothing else pulled the audible audio back onto the video clock, so the two inputs drifted (one session's log shows the offset walking from -290 ms to +1250 ms while the servo only printed "would have SKIP"). It now acts after two consecutive samples outside the tolerance band, at most 400 ms per step, and never while the picture is parked at the end of the media. Tuning: `-Ddreamdisplayx.avServo=false` disables it, `-Ddreamdisplayx.avToleranceMs=…` / `-Ddreamdisplayx.avMaxActionMs=…` set the band and the step.
+- Repeated audio near the end of a VOD no longer happens: the A/V alignment used to `set_time` the audio BACKWARDS whenever it ran ahead, which replays exactly what was just heard. It now skips PCM forward while the picture has runway, and leaves the audio untouched once the picture sits in the last seconds of the media (where a frozen video clock is the stream ending, not a stall — logged as `A/V align (…): audio …ms ahead while the picture sits at the end`).
+- A newly set video autoplays instead of parking on its first frame: a display with no saved viewer settings defaulted to `paused = true`, so the player decoded one frame and suspended (a live room then produced about a second of sound and went silent). A live session also never starts parked now — a live stream has no position to resume, so only an explicit viewer pause may hold it.
+- Retrying a live room now really re-fetches it: a live playurl is session bound and its resolved entry is cached for ~25 s, so the old retry handed the player the same dead URL and looked like it did nothing. Retry invalidates every resolver cache for the URL first, and a live retry always starts playing instead of inheriting the paused state of the failed session.
+- The stray framed box that showed up at the screen corner together with the error panel is gone: with the panel up, `drawScreen` returns before any layout pass, so every other control was still drawn where it was last placed (a settings control is exactly 130x22, matching the box, and its value text was the number touching the border). The panel now hides every widget it does not place itself, and the per-frame state sync brings them back as soon as the panel is dismissed.
+- Closing the error panel now returns the display to its idle state: the ✕ sends `SetVideo` with a blank URL, the server accepts that as "clear this display" (empties the url/lang, resets the timeline, persists and rebroadcasts), and every client stops its player, drops the error and shows the idle placeholder again — no video left sitting on a failure. The blank-url branch skips the URL policy (which only judges real links) but still requires the sender to be in range and allowed to set the video. Only the vanilla path carries it: the Paper action lives in a `@PaperOnly` file that the Fabric build cannot recompile, and Paper servers are outside this fork's scope.
+- Dismissing the error panel is remembered on the display, not on the menu instance, so reopening the menu after closing an offline live room no longer shows the same panel again; only a different failure brings it back.
+- Closing the error panel no longer leaves the display stuck with no way out: the ✕ dismisses the panel in place (a later, different failure shows it again) and the menu comes back usable — the search panel and tabs stay live, so a failed video can be replaced instead of requiring the display to be deleted or the command to be retyped. The error panel's own buttons are hidden while it is dismissed so they cannot be drawn at a stale position.
+- The version in the menu's corner label sits 6 px right of the mod name instead of touching it.
+- An offline live room's error panel shows a single Close button: the Bilibili resolver only reports NOT_FOUND for a live room when `Room/get_info` answered `live_status != 1`, so there is nothing for Retry to fix. The panel skips hidden buttons (one centered Close) and the hint reads "close this menu, the display stays" instead of "try again".
+- The error panel's third button closes the prompt instead of deleting the display: it used to be the destructive delete button sitting right next to Retry, which read as an unexplained action (a live room that is offline lands there). Deleting still lives in the settings tab's owner actions.
+- The playlist queue has bulk selection: the trash button opens a bar with `Selected N / M`, `Select all` / `Clear selection`, `Delete selected` and `Exit bulk`; while it is open, clicking a row ticks it (a `☑` box appears and the row highlights) and `Delete selected` only deletes on a second press inside four seconds, so a misclick cannot wipe the queue.
+- A live stream always starts at offset 0: a remembered or primed resume position is no longer carried into it, which had produced `cold start (t=879291ms, live=true)` and a 10 s `libvlc first frame timeout` before the retry.
+- The Borderless console caret is a three-way choice — solid, off, or blinking — instead of an on/off blink flag, because a blinking caret sometimes vanished over video. An existing config keeps its old value.
+- A rewritten pasted link shows its head, not its tail: only the visible window rewinds, so the caret stays at the end where normal pasting leaves it.
+- The Borderless console now closes with its video on every exit path: Esc / `exit` / `F` go through `dismissActive`, which used to skip the console (only `remove()` closed it), and the console screen also closes itself the moment no Borderless overlay is active any more, so a finished or dismissed video can never leave the input line floating over the world.
+- The Borderless console keeps its input focused, so clicking elsewhere no longer leaves the caret gone and typing dead, and the caret mode now pins the same clock vanilla reads (`Util.getMillis`). A mismatch there is what made the caret flip between solid and absent; every mode/focus change now logs `console caret mode=… focused=… parity=…`.
+- Pasted links are cleaned in the search box itself: a share blob is reduced to its first URL, Bilibili tracking parameters are dropped, and other platforms lose only their referral parameters (`si`, `pp`, `feature`, `utm_*`, `gclid`, `tt_content`, ...), so signed stream URLs keep their auth parameters.
+- A pasted uploader space card shows the creator's avatar and name, and a pasted media list card shows its real title and cover instead of a placeholder on a broken thumbnail.
+- A pasted uploader space card now reads like a creator card: avatar, name, follower count and video count, and clicking it opens that creator's page.
+- Importing a Bilibili favourites / media list reports progress in a status line under the playlist URL row (`Importing 50/128`, then the queued count or the failure reason) and fades out on its own, and the queue is filled in batches of 50 instead of one packet per video: a new `ADD_MANY` command appends the whole chunk in a single server mutation, capped at 300 entries per import. Servers that predate the batch command still get the per-item path.
+- Two config entries for the Borderless console: `borderless-console` (start Borderless with the console enabled) and the `borderless-console-caret` mode selector (`solid` / `off` / `blink`), both rendered in the config screen on Fabric and NeoForge.
+
+### Fixes
+
+- The audio player is no longer natively paused when a display is parked or pre-started: pausing it before its input reached PLAYING stuck it in libvlc's PAUSED state, where `set_pause(0)` and `play()` both fail to revive it, so the sound only came back after the watchdog rebuilt the input (seconds late, and every resume). Parking now gates the PCM line only, and a resume realigns the audio clock to the parked position before the line reopens.
+- A display that parks before its first frame no longer stays grey: nothing may be published while parked, so a session paused within the first second (`first frame not uploaded yet; deferring park`, then the park landed anyway) kept the wall on the placeholder until the viewer pressed play. The first picture of a session is now always let through the parked gate.
+- A short seek no longer blanks the display: the timeline follower dropped the rendered frame on every catch-up, so a 5 s correction showed the grey placeholder until the landing frame decoded. The frame is now only dropped when the jump is larger than 15 s.
+- Fast scrubbing no longer loses the sound: the seek gate used to natively pause the audio player, and a chain of quick seeks could leave it in libvlc's PAUSED state where `play()` would not revive it (the watchdog then rebuilt the audio input, costing seconds of silence). The gate now silences through the PCM gate only and realigns the clock on release.
+- Sound no longer arrives seconds after the picture on a resume: the long-pause path reopens only the video input and returns early, so the audio player was left in libvlc's PAUSED state and `set_pause(0)` alone does not restart it (it reported progress while delivering nothing). Releasing the seek gate now also issues `play()` on the audio player, and the audio watchdog retries the unpause after 1 s instead of waiting 3 s and rebuilding the input.
+- A stalled picture no longer eats seconds of audio: when the video clock stopped, the A/V alignment read the runaway audio as "ahead" and skipped 1180 ms and then 7354 ms of PCM in one go. Corrections are now skipped entirely while the picture clock is not advancing (one warning names the frozen clock), and the one-shot startup alignment only applies within 20 s of a session start or an audio re-attach instead of at any point in a long playback.
+- The video stall warning now dumps the last libvlc log lines before reopening the input, so a silent input stall leaves a reason behind.
+- The A/V corrector no longer repeats the same correction forever: dropping PCM does not move libvlc's audio clock, so the measured error never improved and a ~450 ms offset was "skipped 400 ms" every 10 s while the audible sound kept sliding ahead. The output now accumulates what catch-up actually dropped and the corrector measures the audible position (`audioClock + skipped`); the sample line reports `skipped=…ms` and the action line reports the running total.
+- A resume no longer gets a false "still parked" verdict from one still sample: the check now needs two consecutive non-advancing clock samples, ignores the whole seek/reopen settle window, and compares against the previous sample instead of the original target, so a fast pause/play during scrubbing no longer costs an unnecessary input reopen.
+- An `END_REACHED` that arrives within 6 s of a seek/reopen is treated as an input artifact: the player re-seeks to the same position instead of re-resolving the stream (which rotated the CDN host and rebuilt the session), capped at two retries per session.
+- A resumed position is no longer lost when the input is reopened after a long pause: the reopened picture could quietly start from zero, and the audio release then dragged the sound onto that wrong clock, so the video restarted from the beginning. The audio now stays gated while the picture sits more than 5 s away from the seek target, and the target is re-asserted.
+- A reopened input that lands at the wrong position is now enforced instead of accepted: `set_time` is re-applied up to 3 times 600 ms apart (a fragmented input only honours it once its demuxer runs), logging the landing position and `seekable` each time; if it still refuses, the session is rebuilt at the target instead of playing on from the wrong place.
+- A seek verifier that gives up no longer releases the audio against the frozen picture: it reopens the input at the target, and when even that fails it escalates to a rebuild.
+- A reopened video input that keeps its size no longer freezes the picture while the sound plays on: libvlc skips `setup()` for an unchanged format, so `formatReady` stayed false after the input cleanup and every frame was refused. The buffer pool re-arms itself, and a run of refused frames is logged instead of being swallowed silently.
+- A video input that never delivers another frame no longer loops `video stall detected` → `reopen failed` forever: the reopen budget is restored as soon as a frame lands, and once it is spent the whole session is rebuilt from the audio clock (3 tries, 10 s apart). If the picture still does not return, the audio is stopped and the error panel is shown, so a frozen frame can no longer play on with sound.
+- A stalled player sitting within 12 s of the media end now ends the session instead of being rebuilt, so the end of a part is not mistaken for a broken input. A refused reopen also states why (budget spent / no player / url rejected / native throw) and dumps the recent libvlc log.
+- The video stall watchdog no longer clears its counter when the decoder keeps republishing one frame, so a frozen picture with a stalled clock is now detected: play retry after 3 s, video reopen after 6 s.
+- Pasted space / media-list cards no longer ask YouTube for a thumbnail derived from their `space:` / `ml:` id, which is why their image slot was always broken.
+- A favourites folder under the creator host (`space.bilibili.com/<mid>/favlist?fid=<id>`) is now imported as a playlist instead of opening the creator page.
+- A cleaned link no longer leaves the search box scrolled to its tail: the caret lands at the start, so the visible part is the host and path.
+- Rewriting a pasted link leaves the caret at the end, like any other paste; the box is no longer moved to the start (that also left the whole URL rendered as selected text).
+- Playlist rows give the uploader / views / duration tag priority over the title, so the duration no longer disappears; a title that does not fit is shown in a hover tooltip instead of scrolling, and the tag sits closer to the move / remove glyphs.
+- Playlist row clicks are bounded to the rows that are actually drawn, so a click below the panel no longer skips the queue.
+- Switching to the Playlist tab no longer focuses the URL box, which had silently disabled every menu hotkey (including F for Borderless) until the player clicked elsewhere.
+- A live session logs its skipped A/V correction once instead of every sample.
+- A freshly re-attached audio input is no longer treated as a multi-second offset while its clock still reads 0 ms.
+- A cold audio decoder that starts seconds after the picture is now aligned once instead of keeping that offset for the whole session.
+- Live streams are no longer repositioned by the A/V startup alignment or the optional corrector: they have no timeline, so `set_time` only re-buffered the audio input and left it paused, which is what kept live audio silent or stuttering for seconds after start.
+- A decoded frame whose size does not match the upload texture is now dropped instead of blanking the surface, so a live source whose reported height jitters (e.g. 1088 vs 1090 lines) no longer flashes grey before the next matching frame.
+- The grey placeholder no longer covers the display while the session is merely buffering or seeking: the last decoded picture stays on screen (and the loading intro no longer replaces it), because the frame is dropped on a URL change anyway.
+- Playlist rows keep the uploader / views / duration tag at its natural width, right-aligned next to the row actions, with the title taking what is left; the fixed-width meta column was dropped because it read worse.
+- A live video stall now reopens the input at the live edge instead of seeking it: a live stream has no timeline, so `:start-time` / `set_time` on the reopened input left the clock at 0 ms and the picture stuck (the audio gate is also not closed for that reopen, so sound keeps playing).
+- Live audio is no longer repositioned: both the release of the warm audio input and a watchdog re-attach skip `set_time` / `:start-time` on a live stream, which had left the audio clock stuck at 0 ms and made live sound take tens of seconds (or never arrive).
+- Hovering the uploader part of a playlist row and pressing V opens that creator's page (Bilibili rows only).
+- A cold start now logs which caller triggered it (`reason=prepare` / `play` / `restart-pipeline` / `seek-fallback` / `loop-restart`), so a duplicate restart can be traced from the log alone.
+- End of stream now persists and reports position 0 before the playlist branch, so a rejected auto-advance cannot leave the tail as the resume point.
+- A finished VOD always restarts from the beginning: end of stream resets the saved position and reports 0 to the server, so rejoining no longer resumes at the tail.
+- Opening Borderless after playback paused or ended now seeds the overlay from the last delivered frame instead of showing black, and closing it re-queues that still frame for the wall.
+- Fixed paused sessions resuming silently: fetching a frame by un-pausing moved the software clock, so the timeline advanced with no audio.
+- Borderless keeps the wall's spatial character but no longer attenuates or muffles by the wall's distance: an overlay that fills the viewport is heard from the screen, so the positional gain stops depending on where the player happens to stand (measured: −1.5 / −6.2 / −10.1 / −15.7 dB against popup playback at 6 / 12 / 20 / 40 blocks before, +1.4 dB at every distance after).
+- Popup and window playback keep the loudness normaliser instead of a bare gain, so switching between a popup and Borderless changes the space rather than the volume (the normaliser targets −16 LUFS with a +12 / −3 dB range).
+- Borderless now suppresses the remaining vanilla HUD layers (status effects, action bar, title, camera overlays) and Sodium Extra's HUD text, so the top-right FPS counter stops flashing through the video when a chat line or the console closes.
+- The Borderless console closes together with its overlay, e.g. when playback ends while the input line is open.
+- Leaving Borderless while paused no longer leaves the wall display black: the parked session is asked for one more frame so the wall is re-seeded, and opening fullscreen on a paused video seeds the overlay the same way.
+
+## Server
+
+### Fixes
+
+- Player selections no longer protect blocks before a display is created (upstream `f7f0cba`).
+- Oversized selections are rejected before the surface census runs.
+
 # 1.10.6.1 Release
 
 Based on Dream Displays [ab46074](https://github.com/arnodoelinger/dreamdisplays/commit/ab46074057d02f31968473a08508cc1882e599b3).
@@ -14,6 +134,10 @@ Based on Dream Displays [ab46074](https://github.com/arnodoelinger/dreamdisplays
 
 - Added 1.18.2, 1.19.4 and 1.20.1 builds for Fabric and Forge.
 - Added an opt-in loading animation with a centered logo, flowing-rainbow waving title, and Windows 11-style spinner.
+- Added an in-game danmaku blocklist importer for Bilibili JSON/XML and DDX text exports.
+- Added Bilibili uploader search with `@` queries, fuzzy uploader matching, and full uploader profile pages with Bilibili-style video grids, zone/collection tabs, 30-video pages, and page-number navigation.
+- Matched Borderless audio gain to the wall display's spatial volume.
+- Displays now resume from their saved position after leaving and re-entering a world.
 
 ### Fixes
 
@@ -28,6 +152,45 @@ Based on Dream Displays [ab46074](https://github.com/arnodoelinger/dreamdisplays
 - Published display state as soon as the first frame lands (upstream `ab46074`).
 - Kept the last decoded frame when a timeline seek arrives while paused (upstream `5c794ade`).
 - Removed per-frame allocations and repeated reflection lookups from the render path (upstream `1d9120aa`).
+- Clearing the search box now clears stale results, and uploader navigation keeps the `Video/UP` scope toggle reachable.
+- Fixed uploader video lists being narrowed to a few keyword matches when opened from a plain UP-name search; only `keyword@UP` carries a video keyword into the uploader page.
+- Fixed uploader video lists coming back empty because Bilibili space requests lacked the anonymous `buvid3`/`buvid4`/`b_nut` fingerprint cookies, with an uploader-name search fallback for intermittent empty responses.
+- Fixed the uploader profile screen rendering into a small top-left canvas instead of filling the window.
+- Removed the uploader header's full-width accent rule and tightened the avatar, name, signature, and stats layout.
+- Fixed uploader tab labels falling back to English and center-cropped the avatar; centered the page-number input.
+- Reworked search-panel uploader results into square-avatar cards with bottom-anchored name and fan/video metadata.
+- Reduced CDN probe log noise and retried transient thumbnail timeouts once without a full stack trace.
+- Fixed pause/resume replaying queued audio as a short echo: the audio line is flushed before the next PCM block, and startup A/V sync no longer treats normal pipeline latency as drift.
+- Fixed long-pause resume leaving the separate audio player silent: resume now re-issues play on the audio channel and flushes/relogs the first post-resume PCM block.
+- Added a continuous audio watchdog: if the video clock advances while the audio clock or the PCM feed stays frozen for three seconds, the audio input is re-attached at the current video position instead of leaving the rest of the video silent.
+- Enabled libvlc HTTP reconnect and added a six-second grace window after audio re-attach, so a transient CDN disconnect does not cascade into repeated audio rebuilds.
+- Fixed silent audio when entering at a large saved position: the separate audio player is positioned by its media-level `:start-time` only; a second `set_time` on a fragmented Bilibili `m4s` could jump the input to EOF.
+- Bilibili audio now prefers Dolby / Dolby Atmos (`30080` / `30250` / `30255`), reads the separate `dash.dolby.audio` block, and keeps AAC (`30216` / `30232` / `30280`) as the recovery fallback.
+- When a Dolby audio input dies, the audio watchdog now rotates through the current track's CDN backups and then the other audio renditions instead of retrying the same URL.
+- Bilibili CDN ranking now promotes the API's `upos-*` backup URLs and leaves the signed `mcdn` edge last; signed `mcdn` URLs are no longer host-rewritten. Explicit mirror settings only rewrite `upos-*` URLs.
+- Fixed direct playback starting audio after the first video frame: the desktop audio input now pre-opens paused and is aligned to the video clock before release, so a slow audio decoder no longer leaves the first seconds silent.
+- Fixed pause pressed during a first-frame wait being overwritten by the audio start path: the pause intent is retained and the session parks only after a real frame arrives.
+- Fixed the animated loading screen staying on after the decoder delivered its first frame; a decoded first frame now counts as started, and paused-start parking waits until a frame actually reaches the GPU texture.
+- Fixed search-result cards having inconsistent text row counts: cards now use one truncated title line plus one meta line, and the generic "New" badge was removed so the thumbnail stays unobstructed.
+- Fixed imported danmaku block words showing boxed LF glyphs in the config field: imported rules are normalized to one comma-separated line, and the parser keeps comma/semicolon regex rules intact.
+- Fixed the search box showing only the tail of a pasted video URL even when the text fit: the edit box now recalculates its horizontal display offset whenever its width changes.
+- Added a pink `合作` badge for Bilibili co-authored videos on search results and uploader video cards; `is_union_video` and `is_cooperation` are both recognized.
+- Reduced verbose libvlc logging overhead by dropping HTTP/2 DATA, WINDOW_UPDATE, SETTINGS, and PING frame lines, which dominated the diagnostic log without aiding playback diagnosis.
+- Fixed seeking moving the clock and audio while the video picture stayed on the old timeline: desktop seeks now reopen the video input at the target, drop queued pre-seek frames, and wait for a fresh frame instead of trusting libvlc's runtime `set_time`; deferred re-opened inputs apply the target after their first frame.
+- Fixed seeking while paused leaving the old frame on screen: the target frame is now uploaded once while parked and the video input is paused again, without starting the playback clock.
+- Fixed long pauses resuming into libvlc `BUFFERING`: after a pause of 5 seconds or more the video input is reopened at the parked position immediately instead of waiting for the resume watchdog to recover the stale warm player. Audio is held until that target frame arrives, so a stale pre-reopen frame cannot release it at the old position.
+- Tightened A/V sync after subtracting the PCM line lead: startup/drift tolerance is now 120 ms instead of 1200/500 ms, and corrections re-measure instead of accepting the first offset as pipeline latency. A hard 400 ms error is corrected even while the offset is still changing, which fixes the large desync left after a pause/resume.
+- Fixed the scrub preview starting from a signed `mcdn` URL while the playing stream used an `upos` mirror: preview extraction now picks the API's `upos` backup first.
+- Fixed the scrub preview staying on the old thumbnail after a seek: the reused extractor keeps its decode buffers across same-size format cleanup and re-issues `play` before seeking, after `set_time`, and before the frame latch; timeout logs now include display count, format size, player state, and time.
+- Fixed hardware decoding being demoted to software by generic FFmpeg timestamp warnings during normal seeks; only hardware-specific failures now advance the backend chain, and each session logs the active decoder at first frame.
+- Fixed long pauses leaving the video player frozen while audio resumed: resume now re-issues play and runs a short watchdog when the video clock does not advance.
+- Added a runtime video watchdog: a stalled picture first retries play, then reopens only the video input at the current audio position if the stall persists.
+- Fixed paused starts parking before the first decoded frame, which could leave the display on the loading animation while the preview already had an image; the session now waits for a real frame before suspending.
+- Added `auto-play-on-join` (default off) so LOCAL displays can stay paused when a world loads.
+- Added Chinese labels for the new auto-play setting and the existing animated loading screen setting.
+- Fixed the display menu progress bar falling back to the last seek target after playback ended.
+- Fixed client shutdown saving the display position after the player had already stopped, which could persist `0` instead of the last position.
+- Fixed settings-panel scrolling painting partially visible rows over the title and leaving inconsistent spacing above the bottom action buttons.
 
 ## Server
 
@@ -2232,3 +2395,9 @@ No changes.
 ## Server
 
 - First version (not public)
+
+---
+
+# 历史记录（2026-10-30 ~ 2026-11-05，原 `../项目归档.md`，已并入本文件并删除原文件）
+
+以下是逐轮排障的完整记录：每节包含当轮的取证、根因、改动与验证状态。日常查阅请看上面的 Unreleased 小节；这里的细节用于回溯"为什么这么改"。可复用的技术事实与踩坑另见 `TECHNICAL-NOTES.md` 与 `PLAYBACK-STATE-MACHINE.md`。

@@ -12,14 +12,17 @@ import com.dreamdisplayx.api.capability.ServerFeature
 import com.dreamdisplayx.api.display.model.property.DisplayRotation
 import com.dreamdisplayx.api.display.model.property.DisplayFacing
 import com.dreamdisplayx.api.media.model.DreamMediaException
+import com.dreamdisplayx.api.media.model.MediaFailureKind
 import com.dreamdisplayx.api.media.model.StretchMode
 import com.dreamdisplayx.api.media.model.VideoQuality
+import com.dreamdisplayx.api.media.source.url.MediaStartTime
 import com.dreamdisplayx.api.media.audio.model.AcousticEnvironment
 import com.dreamdisplayx.api.media.audio.model.AcousticQuality
 import com.dreamdisplayx.api.media.audio.model.SourceAcousticState
 import com.dreamdisplayx.api.media.audio.model.SourcePlane
 import com.dreamdisplayx.api.media.audio.service.keys.AudioAcousticsServices
 import com.dreamdisplayx.api.media.stream.model.MediaStream
+import com.dreamdisplayx.api.media.source.model.MediaSource
 import com.dreamdisplayx.api.media.source.model.SubtitleTrack
 import com.dreamdisplayx.api.playback.model.DisplayAccess
 import com.dreamdisplayx.api.playback.model.FullscreenMode
@@ -32,11 +35,16 @@ import com.dreamdisplayx.api.playback.model.WatchPartyAction
 import com.dreamdisplayx.api.playback.model.WatchPartySessionState
 import com.dreamdisplayx.api.playback.policy.PlaybackPermissions
 import com.dreamdisplayx.api.display.model.settings.ClientDisplaySettings
+import com.dreamdisplayx.api.media.service.keys.MediaServices
+import com.dreamdisplayx.api.runtime.registry.service.getOrNull
 import com.dreamdisplayx.api.watchparty.model.WatchPartySession
 import com.dreamdisplayx.core.protocol.common.hasFeature
 import com.dreamdisplayx.core.protocol.common.packets.*
 import com.dreamdisplayx.media.player.MediaPlayer
+import com.dreamdisplayx.media.source.bilibili.BilibiliPart
+import com.dreamdisplayx.media.source.bilibili.BilibiliPartListCache
 import com.dreamdisplayx.platform.client.Initializer
+import com.dreamdisplayx.platform.client.console.BorderlessConsoleScreen
 import com.dreamdisplayx.platform.client.audio.ListenerPoseTracker
 import com.dreamdisplayx.platform.client.audio.VoxelAcousticsProbe
 import com.dreamdisplayx.platform.client.core.DreamServices
@@ -44,6 +52,7 @@ import com.dreamdisplayx.platform.client.danmaku.ClientDanmakuController
 import com.dreamdisplayx.platform.client.displays.DisplayScreen.Companion.DEFAULT_QUALITY
 import com.dreamdisplayx.platform.client.displays.DisplayScreen.Companion.ENV_PROBE_INTERVAL_TICKS
 import com.dreamdisplayx.platform.client.managers.ClientPacketManager
+import com.dreamdisplayx.platform.client.player.platform.DreamPlaybackEnvironment
 import com.dreamdisplayx.platform.client.managers.ClientStateManager
 import com.dreamdisplayx.platform.client.managers.DisplayPopoutManager
 import com.dreamdisplayx.platform.client.managers.PlaylistStateStore
@@ -57,6 +66,7 @@ import com.dreamdisplayx.util.FacingUtil
 import net.minecraft.client.Minecraft
 import net.minecraft.client.renderer.texture.DynamicTexture
 import net.minecraft.core.BlockPos
+import net.minecraft.network.chat.Component
 import org.slf4j.LoggerFactory
 import java.nio.ByteBuffer
 import java.util.*
@@ -427,6 +437,12 @@ class DisplayScreen(
     /** Last known playback position in nanoseconds, restored on reconnect. */
     var savedTimeNanos: Long = 0
 
+    /** Start offset carried by the next loaded URL (`?t=`), applied once the player swaps to it. */
+    private var pendingUrlStartNanos: Long = 0
+
+    /** Set while the next rendered wall frame after a fullscreen close should be logged once. */
+    private var logNextFrameAfterFullscreen = false
+
     /** Tick counter throttling how often this LOCAL screen reports its position to the server. */
     private var positionReportTicks = 0
 
@@ -514,8 +530,24 @@ class DisplayScreen(
     /** Audio track / language of the current video, or `null` when idle. */
     var lang: String? = null; private set
 
-    /** True once the video is effectively playing: not awaiting the initial timeline and a frame has filled. */
-    val isVideoStarted: Boolean get() = !stillWaitingForInitialTimeline() && (hasEverRendered || mediaPlayer?.textureFilled() == true)
+    /** True once playback is effectively started: the decoder delivered a frame, or a frame already uploaded. */
+    val isVideoStarted: Boolean get() =
+        !stillWaitingForInitialTimeline() &&
+            (hasEverRendered || mediaPlayer?.textureFilled() == true || mediaPlayer?.hasFirstFrame() == true)
+
+    /** True after at least one decoded frame was uploaded to the GPU texture. */
+    internal val hasRenderedFrame: Boolean get() = hasEverRendered
+
+    /**
+     * True while the last decoded picture may stay on screen. Deliberately ignores buffering / seek
+     * state: swapping the picture for the grey placeholder during a rebuffer is what made a short
+     * stall look like the display went blank, and the stale frame is dropped on URL change anyway.
+     */
+    val hasPictureToShow: Boolean
+        get() = hasEverRendered && hasTexture && renderType != null && !errored
+
+    /** True while a seek is still fetching the target frame; the loading animation covers it. */
+    val isSeekBuffering: Boolean get() = mediaPlayer?.isSeekBuffering() == true
 
     /**
      * Last value of [isVideoStarted] that was published to the registry.
@@ -539,6 +571,13 @@ class DisplayScreen(
     private fun markRendered() {
         if (!hasEverRendered) firstFrameNanos = System.nanoTime()
         hasEverRendered = true
+        if (logNextFrameAfterFullscreen) {
+            logNextFrameAfterFullscreen = false
+            logger.info(
+                "{} wall uploaded a frame after fullscreen close: paused={} textureFilled={} firstFrame={}.",
+                uuid, paused, mediaPlayer?.textureFilled() == true, mediaPlayer?.hasFirstFrame() == true,
+            )
+        }
     }
 
     /** First-frame fade-in progress (0..1 eased); 1 = no fade or replay reappear. */
@@ -553,6 +592,9 @@ class DisplayScreen(
 
     /** True while a PiP or window popout is open for this display. */
     val isPopoutActive: Boolean; get() = popoutManager.isActive
+
+    /** Window / PiP bypass spatial audio; fullscreen keeps the wall's spatial volume. */
+    private val spatialBypass: Boolean get() = isPopoutActive && !isFullscreenActive
 
     /** True for a fullscreen broadcast's synthetic display. */
     var virtual: Boolean = false
@@ -570,6 +612,9 @@ class DisplayScreen(
 
     /** Total duration of the current video in nanoseconds, or `0` if unknown / live. */
     val mediaPlayerDurationNanos: Long get() = mediaPlayer?.getDuration() ?: 0L
+
+    /** Frozen pause position, or null while playing; used by the save policy. */
+    internal val parkedPositionNanos: Long? get() = mediaPlayer?.parkedPositionOrNull()
 
     /** Raw stream URL for seek-bar scrub-preview frame extraction; null for live/unresolved. */
     val scrubPreviewRawUrl: String? get() = mediaPlayer?.capturedStreamRawUrl()
@@ -647,11 +692,67 @@ class DisplayScreen(
         loadVideoInternal(videoUrl, lang, true)
     }
 
+    /** Error instance the viewer already closed; the panel stays away until a different failure. */
+    @Volatile
+    var dismissedMediaError: DreamMediaException? = null
+
+    /** True when the display currently plays a Bilibili live room link. */
+    internal val isLiveRoomUrl: Boolean
+        get() = (MediaSource.from(videoUrl.orEmpty()) as? MediaSource.Bilibili)?.roomId != null
+
+    /**
+     * True when the failure means the room is simply not streaming. The Bilibili resolver only
+     * returns NOT_FOUND for a live room when `Room/get_info` said `live_status != 1`, so a retry can
+     * only produce the same error: the panel offers Close alone in that case.
+     */
+    internal val errorIsLiveOffline: Boolean
+        get() = isLiveRoomUrl && mediaError?.kind == MediaFailureKind.NOT_FOUND
+
     /** Re-attempts current video after failure; purely local, no server packet. */
     fun retryVideo() {
         val url = videoUrl ?: return
         lastRetryMark = TimeSource.Monotonic.markNow()
-        loadVideoInternal(url, lang ?: "", preservePausedState = true)
+        // A retry has to re-mint the stream: a live playurl is session bound and its resolved entry
+        // lives ~25 s, so replaying the cached one only reproduces the failure. VODs are not cached.
+        DreamPlaybackEnvironment.cacheInvalidator.invalidate(url)
+        // Retrying a live room is a reconnect, so it must start playing instead of inheriting the
+        // parked state the failed session left behind.
+        val liveRoom = (MediaSource.from(url) as? MediaSource.Bilibili)?.roomId != null || isLive
+        loadVideoInternal(url, lang.orEmpty(), preservePausedState = !liveRoom)
+    }
+
+    /** Asks the server to empty this display's video, so every viewer returns to the idle state. */
+    fun clearVideo() {
+        if (!canSetVideoHere) return
+        clientUrlOverride = false
+        ClientSettingsStore.setUrlOverride(uuid, null, null)
+        Initializer.sendPacket(SetVideo(uuid, "", ""))
+    }
+
+    /** Drops the current video locally: no player, no error, idle placeholder. */
+    private fun clearVideoLocal() {
+        media.stopPlayback()
+        videoUrl = ""
+        lang = ""
+        mediaError = null
+        dismissedMediaError = null
+        savedTimeNanos = 0L
+        pausedByEnded = false
+        paused = false
+        hasEverRendered = false
+        firstFrameNanos = 0L
+        ClientSettingsStore.setSavedTimeNanos(uuid, 0L, null)
+        DisplayRegistry.recordScreen(this)
+        logger.info("video cleared; display is idle.")
+    }
+
+    /**
+     * Pushes the position that was just persisted to the server as well. Its own reports are throttled
+     * to a few seconds, so without this the server keeps a stale resume point for the next join.
+     */
+    internal fun reportPositionOnExit(positionNanos: Long) {
+        if (mode != PlaybackMode.LOCAL || watchParty != null) return
+        Initializer.sendPacket(ReportPosition(uuid, positionNanos.coerceAtLeast(0L)))
     }
 
     /** Requests a server-authoritative video change from a picked suggestion. */
@@ -668,6 +769,9 @@ class DisplayScreen(
 
     /** Internal loader: delegates the player swap to the [media] controller. */
     private fun loadVideoInternal(videoUrl: String, lang: String, preservePausedState: Boolean) {
+        // A pasted link carrying `?t=` starts there instead of at the stored resume position.
+        pendingUrlStartNanos = MediaStartTime.extractMillis(videoUrl) * 1_000_000L
+        if (pendingUrlStartNanos > 0L && videoUrl != this.videoUrl) savedTimeNanos = pendingUrlStartNanos
         media.load(videoUrl, lang, preservePausedState)
     }
 
@@ -683,10 +787,21 @@ class DisplayScreen(
 
     /** Records the new [videoUrl] and [lang] when the media controller swaps players. */
     internal fun onVideoSwapped(videoUrl: String, lang: String) {
+        val changed = !this.videoUrl.isNullOrEmpty() && this.videoUrl != videoUrl
         previousVideoUrl = this.videoUrl
         this.videoUrl = videoUrl
         this.lang = lang
-        savedTimeNanos = 0L
+        // Keep the disk/server restore position on the first load and on same-URL reloads.
+        if (changed) {
+            savedTimeNanos = pendingUrlStartNanos
+            // Borderless keeps the previous frame on screen until the new one decodes: swapping inside
+            // an overlay must not drop back to the loading animation between playlist items.
+            if (!isFullscreenActive) {
+                hasEverRendered = false
+                firstFrameNanos = 0L
+            }
+        }
+        pendingUrlStartNanos = 0L
         waitingForInitialTimeline = requiresServerTimeline()
         waitingSinceNanos = if (waitingForInitialTimeline) System.nanoTime() else 0L
     }
@@ -791,8 +906,16 @@ class DisplayScreen(
             savedTimeNanos = packet.positionNanos
         }
 
+        // An empty URL is the server saying "this display is idle now" (the viewer cleared a failed
+        // video). Drop the player and the error so the display shows its idle placeholder again.
+        if (packet.url.isEmpty()) {
+            if (!videoUrl.isNullOrEmpty() || mediaError != null) clearVideoLocal()
+            return
+        }
+
         if (videoUrl != packet.url || lang != packet.lang) {
             val previousUrl = videoUrl
+            val hadVideo = !previousUrl.isNullOrEmpty()
             if (clientUrlOverride && canSetVideoHere) return
             if (clientUrlOverride) {
                 clientUrlOverride = false
@@ -805,16 +928,20 @@ class DisplayScreen(
             if (!override.isNullOrEmpty() && canSetVideoHere) {
                 clientUrlOverride = true
                 val overrideLang = ds.langOverride ?: packet.lang
-                paused = false
-                if (override != previousUrl) savedTimeNanos = 0L
+                if (hadVideo && override != previousUrl) {
+                    paused = false
+                    savedTimeNanos = 0L
+                }
                 loadVideo(override, overrideLang)
                 return
             } else if (!override.isNullOrEmpty()) {
                 ClientSettingsStore.setUrlOverride(uuid, null, null)
             }
 
-            paused = false
-            if (packet.url != previousUrl) savedTimeNanos = 0L
+            if (hadVideo && packet.url != previousUrl) {
+                paused = false
+                savedTimeNanos = 0L
+            }
             loadVideo(packet.url, packet.lang)
             sendRequestSyncPacket()
         }
@@ -976,7 +1103,25 @@ class DisplayScreen(
     /** Closes the fullscreen overlay, keeping other popout surfaces alive. */
     fun deactivateFullscreen() {
         popoutManager.deactivateFullscreen(mediaPlayer)
+        // Diagnosing "wall is black after leaving Borderless while paused": report what the screen
+        // still believes about its frame. Matches the `paused` in the media player's `pause at` line.
+        logNextFrameAfterFullscreen = paused
+        logger.info(
+            "{} fullscreen closed: paused={} rendered={} textureFilled={} videoStarted={} time={}ms.",
+            uuid, paused, hasEverRendered, mediaPlayer?.textureFilled() == true, isVideoStarted,
+            currentTimeNanos / 1_000_000L,
+        )
     }
+
+    /** One-shot: true for the first wall render after a fullscreen close, for the render-gate probe. */
+    internal fun consumeFullscreenCloseProbe(): Boolean =
+        logNextFrameAfterFullscreen.also { logNextFrameAfterFullscreen = false }
+
+    /** Render-gate snapshot reported by [consumeFullscreenCloseProbe]. */
+    internal fun renderGateSummary(): String =
+        "dormant=$isDormant hasTexture=$hasTexture videoStarted=$isVideoStarted " +
+            "renderType=${renderType != null} seekBuffering=$isSeekBuffering paused=$paused " +
+            "popout=$isPopoutActive textureFilled=${mediaPlayer?.textureFilled() == true}"
 
     /** Swaps fullscreen to non-interactive PiP (forced-broadcast Esc behavior). */
     fun minimizeFullscreenToPip() {
@@ -1046,20 +1191,36 @@ class DisplayScreen(
         emitPlaybackIntent(if (paused) PlaybackAction.PAUSE else PlaybackAction.PLAY)
     }
 
-    /** Applies the server's pause state without emitting any upstream intent (timeline-follower path). */
-    internal fun applyServerPaused(paused: Boolean) = applyPausedLocal(paused)
+    /**
+     * Applies the server's pause state without emitting any upstream intent (timeline-follower path).
+     * A live stream has no timeline, so a stale server pause parked it right after the first frame; live
+     * pause state stays a purely local decision.
+     */
+    internal fun applyServerPaused(paused: Boolean) {
+        if (isLive && paused) return
+        applyPausedLocal(paused)
+    }
 
     /** Toggles the local player's pause state and persists it; never touches the network. */
     private fun applyPausedLocal(paused: Boolean) {
         if (!videoStarted) {
             this.paused = paused
+            ClientSettingsStore.updateSettings(uuid, volume, quality, brightness, muted, paused)
             DisplayRegistry.recordScreen(this)
             waitForMFInit { startVideo() }
             return
         }
         if (this.paused == paused) return
         this.paused = paused
-        if (paused) mediaPlayer?.pause() else mediaPlayer?.play()
+        if (paused) {
+            // Persist the visible pause position; the periodic server report stops while paused.
+            val position = currentTimeNanos.coerceAtLeast(0L)
+            savedTimeNanos = position
+            ClientSettingsStore.setSavedTimeNanos(uuid, position, videoUrl)
+            mediaPlayer?.pause()
+        } else {
+            mediaPlayer?.play()
+        }
         ClientSettingsStore.updateSettings(uuid, volume, quality, brightness, muted, paused)
         DisplayRegistry.recordScreen(this)
     }
@@ -1070,18 +1231,28 @@ class DisplayScreen(
         // after a newer video has already replaced the screen state. Reject it before touching
         // fullscreen, resume, or playlist state.
         if (playbackGeneration != mediaGeneration) return
-        if (isFullscreenActive && !fullscreenLoop) deactivateFullscreen()
 
-        if (effectiveMode != PlaybackMode.LOCAL) return
-        // Never persist the tail as a resume point: the next start would immediately reach EOS and
-        // re-enter the replay loop. Reset to the beginning instead.
-        val duration = mediaPlayerDurationNanos
-        savedTimeNanos = if (duration > 0L && isTailResumePosition(positionNanos, duration)) 0L
-        else positionNanos.coerceAtLeast(0L)
+        if (effectiveMode != PlaybackMode.LOCAL) {
+            if (isFullscreenActive && !fullscreenLoop) deactivateFullscreen()
+            return
+        }
+        // A finished VOD always restarts from the beginning: playback can end seconds before the
+        // duration (decoder EOS, dropped tail), and the old 500 ms tail guard let such a position
+        // through, so the next join resumed near the end and immediately hit EOS again.
+        savedTimeNanos = 0L
+        // Persist and report the reset BEFORE the playlist branch: a queue advance returns early, and
+        // a rejected NEXT must not leave the server holding the tail as the resume point.
+        ClientSettingsStore.setSavedTimeNanos(uuid, 0L, videoUrl)
+        pendingPositionReportNanos = Long.MIN_VALUE
+        Initializer.sendPacket(ReportPosition(uuid, 0L))
         // LOCAL playlist auto-advance: an enabled queue moves on at EOS (the server's NEXT handler
         // wraps under LOOP_CURRENT and rejects a CONTINUE overrun). Only the owner's / an admin's
         // NEXT passes the server gate, so several viewers hitting EOS together cannot double-advance.
+        // A queue advance keeps the Borderless overlay open: it is the same session, next item.
+        // A multi-part VOD advances inside itself: P1 ending should start P2, not the queue's next video.
+        if (advanceToNextPart()) return
         if (advanceLocalPlaylistOnEnd()) return
+        if (isFullscreenActive && !fullscreenLoop) deactivateFullscreen()
         if (paused) return
         // Mark WHY we are pausing: a natural end is not user intent, so the next video load
         // (playlist advance, suggestion, ...) clears it via the paused setter and autoplays.
@@ -1253,9 +1424,19 @@ class DisplayScreen(
 
     /** Allocates (or reallocates) the GPU texture and render type for the current quality setting. */
     fun createTexture() {
-        hasEverRendered = false
-        firstFrameNanos = 0L
+        // A reallocation drops the decoded frame; while paused none arrives to replace it, so the
+        // display fell back to the loading placeholder forever. Keep the live allocation when the
+        // size is unchanged, and keep hasEverRendered so a real resize keeps the video quad.
+        if (textureResource.hasSameSize(width, height, effectiveTextureHeight(), videoContentAspect)) {
+            logger.debug("{} texture allocation unchanged {}x{}.", uuid, textureResource.width, textureResource.height)
+            return
+        }
         textureResource.allocate(width, height, effectiveTextureHeight(), videoContentAspect)
+        firstFrameNanos = 0L
+        logger.info(
+            "{} texture allocated {}x{} renderType={}.",
+            uuid, textureResource.width, textureResource.height, renderType != null,
+        )
     }
 
     /** Stages new-resolution texture; live frame renders until first new frame (render thread only). */
@@ -1349,8 +1530,13 @@ class DisplayScreen(
     /** Primes player volume before prelude audio to avoid blast on return. */
     internal fun primeNewPlayerVolume(mp: MediaPlayer) {
         val player = Minecraft.getInstance().player ?: return
-        val maxRadius = if (isPopoutActive) Double.MAX_VALUE else ClientStateManager.config.defaultDistance.toDouble()
-        mp.primeVolume(if (muted || focusMuted) 0f else volume, getDistanceToScreen(player.blockPosition()), maxRadius)
+        val maxRadius = if (spatialBypass) Double.MAX_VALUE else ClientStateManager.config.defaultDistance.toDouble()
+        val global = ClientStateManager.config.globalAudioMultiplier.coerceIn(0.0, 2.0)
+        mp.primeVolume(
+            if (muted || focusMuted) 0f else (volume * global).toFloat(),
+            getDistanceToScreen(player.blockPosition()),
+            maxRadius,
+        )
     }
 
     /** Whether this display can be parked warm when it leaves render distance (Local VOD on the
@@ -1369,7 +1555,8 @@ class DisplayScreen(
     /** Wakes a [goDormant] display: resumes its warm session from the frozen position and renders again. */
     fun wake() {
         if (!isDormant) return
-        mediaPlayer?.unpark()
+        // A paused display stays parked; its next explicit play resumes from the frozen position.
+        if (!paused) mediaPlayer?.unpark()
         isDormant = false
     }
 
@@ -1478,15 +1665,119 @@ class DisplayScreen(
         replayLastTimelineMs = timelineMs
     }
 
+    /**
+     * Warms the resolver for the next queue entry, so a playlist advance spends less time before the
+     * first frame. Best-effort and idempotent: only the URL that has not been warmed yet is sent.
+     */
+    private fun prefetchNextPlaylistItem() {
+        val state = PlaylistStateStore.stateOf(uuid) ?: return
+        if (!state.enabled || state.currentIndex < 0) return
+        val nextUrl = state.items.getOrNull(state.currentIndex + 1)?.url?.takeIf { it.isNotBlank() } ?: return
+        if (nextUrl == lastPrefetchedUrl) return
+        lastPrefetchedUrl = nextUrl
+        DreamServices.registry.getOrNull(MediaServices.RESOLVER_REGISTRY)
+            ?.prefetch(com.dreamdisplayx.api.media.source.model.MediaSource.from(nextUrl))
+    }
+
+    /** Last queue URL handed to the resolver prefetch, so each entry is warmed once. */
+    private var lastPrefetchedUrl: String? = null
+
+    /**
+     * Plays the next part of a multi-part Bilibili VOD. Returns false when the current link is not a
+     * multi-part video or it is already on its last part.
+     */
+    private fun advanceToNextPart(): Boolean {
+        val source = MediaSource.from(videoUrl ?: "") as? MediaSource.Bilibili ?: return false
+        val bvid = source.bvid ?: return false
+        val current = source.part ?: 1
+        val parts = partList
+        if (parts.isEmpty()) {
+            logger.info("part advance skipped: no part list for {} ({}).", bvid, videoUrl)
+            return false
+        }
+        val next = parts.firstOrNull { it.page > current }
+        if (next == null) {
+            logger.info("part advance skipped: P{} is the last of {}.", current, parts.maxOf { it.page })
+            return false
+        }
+        // The server rebroadcasts every display each second, and a DisplayInfo with a different URL
+        // reloads it from the start: a client-local advance is undone a second later and the finished
+        // part replays. Going through the server (like the chips) also resets the position to 0.
+        if (!canSetVideoHere) {
+            logger.info("part advance skipped: no permission to set the display URL (P{} of {}).", current, parts.size)
+            return false
+        }
+        // Only the owner advances: every viewer hits EOS within a couple of seconds of each other and
+        // each SetVideo resets the new part to 0, which would restart it for everyone.
+        if (!owner) {
+            logger.info("part advance skipped: viewer does not own the display (P{} of {}).", current, parts.size)
+            return false
+        }
+        val total = parts.maxOf { it.page }
+        BorderlessConsoleScreen.showStatus(
+            Component.translatableWithFallback(
+                "dreamdisplayx.part.now_playing", "P%s/%s · %s", next.page, total, next.title,
+            ).string,
+        )
+        if (!switchToPart(next.page)) return false
+        logger.info("part advance: P{} -> P{}/{} ({}) from {} parts.", current, next.page, total, next.title, parts.size)
+        return true
+    }
+
+    /**
+     * Switches this multi-part VOD to [page] through the server, so every viewer follows and the
+     * persisted position restarts at the new part's 0. Returns true when the request went out.
+     */
+    fun switchToPart(page: Int): Boolean {
+        val source = MediaSource.from(videoUrl ?: "") as? MediaSource.Bilibili ?: return false
+        val bvid = source.bvid ?: return false
+        val part = partList.firstOrNull { it.page == page } ?: return false
+        if (page == currentPart) return false
+        if (!canSetVideoHere) return false
+        val from = currentPart
+        playSuggestedVideo("https://www.bilibili.com/video/$bvid?p=$page", lang.orEmpty())
+        logger.info("part switch: P{} -> P{} of {} ({}).", from, part.page, partList.size, part.title)
+        return true
+    }
+
+    /** Re-reads the cached part list for the current video (cheap map lookup, safe to call per tick). */
+    private fun refreshPartList() {
+        val source = MediaSource.from(videoUrl ?: "") as? MediaSource.Bilibili
+        val key = BilibiliPartListCache.keyOf(source?.bvid, source?.avid)
+        if (key == null) {
+            partList = emptyList()
+            partListKey = null
+            return
+        }
+        if (key != partListKey) {
+            partListKey = key
+            BilibiliPartListCache.request(key, source?.bvid, source?.avid)
+        }
+        partList = BilibiliPartListCache.known(key).orEmpty()
+    }
+
+    /** Parts of the current multi-part VOD, or an empty list. */
+    internal val parts: List<BilibiliPart> get() = partList
+
+    /** 1-based part the display is playing right now. */
+    internal val currentPart: Int
+        get() = (MediaSource.from(videoUrl ?: "") as? MediaSource.Bilibili)?.part ?: 1
+
+    private var partList: List<BilibiliPart> = emptyList()
+    private var partListKey: String? = null
+
     /** Called every game tick to update distance-based volume attenuation from [pos]. */
     fun tick(pos: BlockPos) {
         syncReplayFrame()
-        val maxRadius = if (isPopoutActive) Double.MAX_VALUE else ClientStateManager.config.defaultDistance.toDouble()
+        refreshPartList()
+        prefetchNextPlaylistItem()
+        val maxRadius = if (spatialBypass) Double.MAX_VALUE else ClientStateManager.config.defaultDistance.toDouble()
         val distance = getDistanceToScreen(pos)
         mediaPlayer?.tick(distance, maxRadius)
         publishStartedFlip()
         if (!isVideoStarted || paused) DynamicDisplayLights.remove(uuid)
         reportPositionToServer()
+        BilibiliSponsorSkip.tick(this)
         if (isPopoutActive) {
             if (distanceQualitySteps != 0) {
                 distanceQualitySteps = 0
@@ -1509,7 +1800,8 @@ class DisplayScreen(
                 plane = plane,
                 userVolume = (volume * globalMultiplier).toFloat(),
                 muted = muted || focusMuted,
-                bypassSpatial = isPopoutActive,
+                bypassSpatial = spatialBypass,
+                flatDistance = popoutManager.isBorderlessActive,
                 acousticsEnabled = acousticsEnabled,
                 environment = probeEnvironment(plane),
             ),
@@ -1527,7 +1819,7 @@ class DisplayScreen(
      */
     private fun probeEnvironment(plane: SourcePlane): AcousticEnvironment {
         val tier = ClientStateManager.config.audioAcoustics
-        if (isPopoutActive || !acousticsEnabled || (tier != AcousticQuality.ADVANCED && tier != AcousticQuality.ULTRA)) {
+        if (spatialBypass || !acousticsEnabled || (tier != AcousticQuality.ADVANCED && tier != AcousticQuality.ULTRA)) {
             cachedEnvironment = AcousticEnvironment.OPEN_AIR
             envProbeCountdown = 0
             return cachedEnvironment
